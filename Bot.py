@@ -26,7 +26,7 @@ from pyrogram.errors import (
 class Config:
     API_ID = 25781839
     API_HASH = "20a3f2f168739259a180dcdd642e196c"
-    BOT_TOKEN = "7585970885:AAGgo0Wc1GXEWd6XB_cuQgtp1-q61WAxnvw"
+    BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"
     ADMIN_IDS = [7584086775]
     DB_NAME = "bot_database.db"
     MEDIA_DIR = "media"
