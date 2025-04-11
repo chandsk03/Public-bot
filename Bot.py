@@ -34,71 +34,25 @@ class Config:
     MAX_RETRIES = 3
     RETRY_DELAY = 5
     TIMEZONE = "UTC"
-    MAX_MESSAGE_LENGTH = 4096  # Telegram message limit
+    MAX_MESSAGE_LENGTH = 4096
+    SCHEDULE_CHECK_INTERVAL = 60  # seconds
+    USER_ACTIVITY_TIMEOUT = 300  # seconds
 
 # Advanced Logging Setup
-class BotLogger:
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        self._setup_logging()
-    
-    def _setup_logging(self):
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        
-        # File handler
-        file_handler = logging.FileHandler(Config.LOG_FILE)
-        file_handler.setFormatter(formatter)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        
-        self.logger.setLevel(logging.INFO)
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(console_handler)
-    
-    def log(self, level: str, message: str, exc_info=None):
-        getattr(self.logger, level)(message, exc_info=exc_info)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(Config.LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-logger = BotLogger()
+# Ensure directories exist
+os.makedirs(Config.MEDIA_DIR, exist_ok=True)
 
-# Database Models with Validation
-class User:
-    def __init__(self, data: Dict):
-        self.id = data.get('id')
-        self.telegram_id = data.get('telegram_id')
-        self.username = data.get('username')
-        self.first_name = data.get('first_name')
-        self.last_name = data.get('last_name')
-        self.join_date = data.get('join_date')
-        self.last_active = data.get('last_active')
-        self.language_code = data.get('language_code', 'en')
-        
-        if not self.telegram_id:
-            raise ValueError("Telegram ID is required")
-
-class ScheduledMessage:
-    def __init__(self, data: Dict):
-        self.id = data.get('id')
-        self.user_id = data.get('user_id')
-        self.target = data.get('target')
-        self.target_type = data.get('target_type')
-        self.text = data.get('text', '')
-        self.media_path = data.get('media_path')
-        self.media_type = data.get('media_type')
-        self.parse_mode = data.get('parse_mode', 'markdown')
-        self.scheduled_time = data.get('scheduled_time')
-        self.status = data.get('status', 'pending')
-        self.created_at = data.get('created_at')
-        self.retry_count = data.get('retry_count', 0)
-        
-        if not all([self.user_id, self.target, self.scheduled_time]):
-            raise ValueError("Missing required fields")
-
-# Advanced Database Manager
+# Database Manager
 class DatabaseManager:
     def __init__(self):
         self.db_path = Config.DB_NAME
@@ -110,10 +64,11 @@ class DatabaseManager:
             self.conn = await aiosqlite.connect(self.db_path)
             self.conn.row_factory = aiosqlite.Row
             await self._initialize_database()
-            logger.log("info", "Database connection established")
+            logger.info("Database connection established")
+            return True
         except Exception as e:
-            logger.log("error", f"Database connection failed: {str(e)}")
-            raise
+            logger.error(f"Database connection failed: {e}")
+            return False
     
     async def _initialize_database(self):
         try:
@@ -130,7 +85,8 @@ class DatabaseManager:
                     last_name TEXT,
                     join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_active TIMESTAMP,
-                    language_code TEXT DEFAULT 'en'
+                    language_code TEXT DEFAULT 'en',
+                    is_admin BOOLEAN DEFAULT FALSE
                 );
                 
                 CREATE TABLE IF NOT EXISTS scheduled_messages (
@@ -148,34 +104,42 @@ class DatabaseManager:
                     retry_count INTEGER DEFAULT 0
                 );
                 
-                CREATE INDEX IF NOT EXISTS idx_scheduled_messages_status ON scheduled_messages(status);
-                CREATE INDEX IF NOT EXISTS idx_scheduled_messages_time ON scheduled_messages(scheduled_time);
+                CREATE TABLE IF NOT EXISTS group_participation (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    group_link TEXT NOT NULL,
+                    group_title TEXT,
+                    group_id INTEGER,
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'joined' CHECK(status IN ('joined', 'left', 'banned', 'kicked'))
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_scheduled_status ON scheduled_messages(status);
+                CREATE INDEX IF NOT EXISTS idx_scheduled_time ON scheduled_messages(scheduled_time);
+                CREATE INDEX IF NOT EXISTS idx_user_active ON users(last_active);
             """)
             await self.conn.commit()
+            logger.info("Database tables initialized")
         except Exception as e:
-            logger.log("error", f"Database initialization failed: {str(e)}")
+            logger.error(f"Database initialization failed: {e}")
             raise
-    
-    async def get_user(self, telegram_id: int) -> Optional[User]:
+
+    async def close(self):
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    "SELECT * FROM users WHERE telegram_id = ?",
-                    (telegram_id,)
-                )
-                row = await cursor.fetchone()
-                return User(dict(row)) if row else None
+            if self.conn:
+                await self.conn.close()
+                logger.info("Database connection closed")
         except Exception as e:
-            logger.log("error", f"Error getting user: {str(e)}")
-            return None
-    
+            logger.error(f"Error closing database: {e}")
+
     async def create_or_update_user(self, user_data: Dict) -> bool:
         try:
             async with self.lock:
+                is_admin = 1 if user_data['id'] in Config.ADMIN_IDS else 0
                 await self.conn.execute(
                     """INSERT INTO users 
-                    (telegram_id, username, first_name, last_name, language_code, last_active)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (telegram_id, username, first_name, last_name, language_code, last_active, is_admin)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                     ON CONFLICT(telegram_id) DO UPDATE SET
                     username = excluded.username,
                     first_name = excluded.first_name,
@@ -184,14 +148,14 @@ class DatabaseManager:
                     last_active = CURRENT_TIMESTAMP""",
                     (user_data['id'], user_data.get('username'), 
                      user_data.get('first_name'), user_data.get('last_name'),
-                     user_data.get('language_code', 'en'))
+                     user_data.get('language_code', 'en'), is_admin)
                 )
                 await self.conn.commit()
                 return True
         except Exception as e:
-            logger.log("error", f"Error creating/updating user: {str(e)}")
+            logger.error(f"Error creating/updating user: {e}")
             return False
-    
+
     async def schedule_message(self, data: Dict) -> Optional[int]:
         try:
             async with self.lock:
@@ -206,10 +170,10 @@ class DatabaseManager:
                 await self.conn.commit()
                 return cursor.lastrowid
         except Exception as e:
-            logger.log("error", f"Error scheduling message: {str(e)}")
+            logger.error(f"Error scheduling message: {e}")
             return None
-    
-    async def get_pending_messages(self) -> List[ScheduledMessage]:
+
+    async def get_pending_messages(self) -> List[Dict]:
         try:
             async with self.lock:
                 cursor = await self.conn.execute(
@@ -218,12 +182,11 @@ class DatabaseManager:
                     ORDER BY scheduled_time ASC
                     LIMIT 100"""
                 )
-                rows = await cursor.fetchall()
-                return [ScheduledMessage(dict(row)) for row in rows]
+                return [dict(row) for row in await cursor.fetchall()]
         except Exception as e:
-            logger.log("error", f"Error getting pending messages: {str(e)}")
+            logger.error(f"Error getting pending messages: {e}")
             return []
-    
+
     async def update_message_status(self, message_id: int, status: str) -> bool:
         try:
             async with self.lock:
@@ -234,88 +197,158 @@ class DatabaseManager:
                 await self.conn.commit()
                 return True
         except Exception as e:
-            logger.log("error", f"Error updating message status: {str(e)}")
+            logger.error(f"Error updating message status: {e}")
             return False
-    
-    async def close(self):
-        try:
-            if self.conn:
-                await self.conn.close()
-                logger.log("info", "Database connection closed")
-        except Exception as e:
-            logger.log("error", f"Error closing database: {str(e)}")
 
-# Enhanced Pyrogram Client
-class BotClient(Client):
-    def __init__(self):
-        super().__init__(
-            name="advanced_bot",
-            api_id=Config.API_ID,
-            api_hash=Config.API_HASH,
-            bot_token=Config.BOT_TOKEN,
-            workers=100,
-            workdir=os.getcwd(),
-            parse_mode=enums.ParseMode.MARKDOWN
-        )
-        self.db = DatabaseManager()
-        self.start_time = datetime.datetime.now()
-    
-    async def initialize(self):
+# Bot Utilities
+class BotUtils:
+    @staticmethod
+    async def parse_schedule_time(time_str: str) -> Optional[datetime.datetime]:
         try:
-            await self.db.connect()
-            await self.start()
-            
-            me = await self.get_me()
-            logger.log("info", f"Bot started as @{me.username} (ID: {me.id})")
-            
-            # Notify admin
-            for admin_id in Config.ADMIN_IDS:
-                try:
-                    await self.send_message(
-                        admin_id,
-                        f"🤖 Bot started successfully!\n\n"
-                        f"🕒 Uptime: {datetime.datetime.now() - self.start_time}\n"
-                        f"💾 Database: {os.path.getsize(Config.DB_NAME) / 1024:.2f} KB"
+            return datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                now = datetime.datetime.now()
+                time_part = datetime.datetime.strptime(time_str, "%H:%M").time()
+                return datetime.datetime.combine(now.date(), time_part)
+            except ValueError:
+                return None
+
+    @staticmethod
+    async def save_media(client: Client, message: Message) -> Optional[tuple]:
+        if not message.media:
+            return None
+        
+        media_type = None
+        file_ext = ""
+        
+        if message.photo:
+            media_type = "photo"
+            file_ext = ".jpg"
+        elif message.video:
+            media_type = "video"
+            file_ext = ".mp4"
+        elif message.document:
+            media_type = "document"
+            file_ext = os.path.splitext(message.document.file_name or "")[1] or ".bin"
+        elif message.audio:
+            media_type = "audio"
+            file_ext = os.path.splitext(message.audio.file_name or "")[1] or ".mp3"
+        
+        file_id = message.media_group_id or message.id
+        file_name = f"{file_id}{file_ext}"
+        file_path = os.path.join(Config.MEDIA_DIR, file_name)
+        
+        try:
+            await client.download_media(message, file_name=file_path)
+            return file_name, media_type
+        except Exception as e:
+            logger.error(f"Failed to save media: {e}")
+            return None
+
+    @staticmethod
+    async def send_message_with_retry(
+        client: Client,
+        target: str,
+        text: str,
+        media_path: Optional[str] = None,
+        media_type: Optional[str] = None,
+        parse_mode: str = "markdown"
+    ) -> bool:
+        retries = 0
+        while retries < Config.MAX_RETRIES:
+            try:
+                if media_path:
+                    full_path = os.path.join(Config.MEDIA_DIR, media_path)
+                    
+                    if media_type == "photo":
+                        await client.send_photo(
+                            chat_id=target,
+                            photo=full_path,
+                            caption=text,
+                            parse_mode=parse_mode
+                        )
+                    elif media_type == "video":
+                        await client.send_video(
+                            chat_id=target,
+                            video=full_path,
+                            caption=text,
+                            parse_mode=parse_mode
+                        )
+                    elif media_type == "document":
+                        await client.send_document(
+                            chat_id=target,
+                            document=full_path,
+                            caption=text,
+                            parse_mode=parse_mode
+                        )
+                    elif media_type == "audio":
+                        await client.send_audio(
+                            chat_id=target,
+                            audio=full_path,
+                            caption=text,
+                            parse_mode=parse_mode
+                        )
+                else:
+                    await client.send_message(
+                        chat_id=target,
+                        text=text,
+                        parse_mode=parse_mode
                     )
-                except Exception as e:
-                    logger.log("error", f"Couldn't notify admin {admin_id}: {str(e)}")
-            
-            return True
-        except Exception as e:
-            logger.log("error", f"Bot initialization failed: {str(e)}")
-            return False
-    
-    async def shutdown(self):
-        try:
-            await self.db.close()
-            if self.is_initialized:
-                await self.stop()
-            logger.log("info", "Bot shutdown completed")
-        except Exception as e:
-            logger.log("error", f"Error during shutdown: {str(e)}")
-        finally:
-            sys.exit(0)
+                return True
+            except FloodWait as e:
+                logger.warning(f"Flood wait for {e.value} seconds")
+                await asyncio.sleep(e.value)
+            except (PeerIdInvalid, ChannelInvalid, ChatAdminRequired, UserNotParticipant) as e:
+                logger.error(f"Invalid target or permissions: {e}")
+                break
+            except Exception as e:
+                logger.error(f"Attempt {retries + 1} failed: {e}")
+                retries += 1
+                await asyncio.sleep(Config.RETRY_DELAY)
+        return False
 
-# Signal Handlers for Graceful Shutdown
+# Initialize Pyrogram Client
+app = Client(
+    name="advanced_bot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+    workers=100,
+    workdir=os.getcwd(),
+    parse_mode=enums.ParseMode.MARKDOWN
+)
+
+# Initialize Database
+db = DatabaseManager()
+
+# Signal Handler for Graceful Shutdown
 def handle_signal(signum, frame):
-    logger.log("info", f"Received signal {signum}, initiating shutdown...")
-    asyncio.create_task(bot.shutdown())
+    logger.info(f"Received signal {signum}, initiating shutdown...")
+    asyncio.create_task(shutdown())
 
-# Initialize Bot
-bot = BotClient()
+async def shutdown():
+    try:
+        await db.close()
+        if app.is_initialized:
+            await app.stop()
+        logger.info("Bot shutdown completed")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+    finally:
+        os._exit(0)
 
-# Register Signal Handlers
 signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
-# Enhanced Command Handlers
-@bot.on_message(filters.command("start"))
-async def start_command(client: BotClient, message: Message):
+# Command Handlers
+@app.on_message(filters.command("start"))
+async def start_command(client: Client, message: Message):
     try:
         user = message.from_user
-        logger.log("info", f"Start command from {user.id} (@{user.username})")
+        logger.info(f"Start command from {user.id} (@{user.username})")
         
-        if not await client.db.create_or_update_user({
+        if not await db.create_or_update_user({
             'id': user.id,
             'username': user.username,
             'first_name': user.first_name,
@@ -341,102 +374,153 @@ async def start_command(client: BotClient, message: Message):
             "Select an option below to get started:",
             reply_markup=keyboard
         )
-    except RPCError as e:
-        logger.log("error", f"Telegram API error in start command: {str(e)}")
-        await message.reply_text("⚠️ Telegram API error. Please try again later.")
     except Exception as e:
-        logger.log("error", f"Unexpected error in start command: {str(e)}")
-        await message.reply_text("⚠️ An unexpected error occurred. Please try again later.")
+        logger.error(f"Error in start command: {e}")
+        await message.reply_text("⚠️ An error occurred. Please try again later.")
 
-# Background Task for Scheduled Messages
-async def process_scheduled_messages():
+@app.on_message(filters.command("schedule"))
+async def schedule_command(client: Client, message: Message):
+    try:
+        user = message.from_user
+        
+        if not message.reply_to_message and not (message.text or message.caption):
+            await message.reply_text("Please reply to a message or include text to schedule.")
+            return
+        
+        args = message.text.split()[1:] if message.text else message.caption.split()[1:]
+        
+        if len(args) < 2:
+            await message.reply_text(
+                "Invalid format. Use:\n"
+                "`/schedule 2023-12-31 23:59 @username`\n"
+                "or\n"
+                "`/schedule 23:59 @username` (for today)\n\n"
+                "You can also attach media files."
+            )
+            return
+        
+        time_str = f"{args[0]} {args[1]}" if len(args) > 2 else args[0]
+        target = args[-1]
+        
+        scheduled_time = await BotUtils.parse_schedule_time(time_str)
+        if not scheduled_time:
+            await message.reply_text(
+                "Invalid time format. Please use:\n"
+                "- YYYY-MM-DD HH:MM for specific dates\n"
+                "- HH:MM for today's time"
+            )
+            return
+        
+        target_type = "user" if target.startswith("@") else "group" if "+" in target else "channel"
+        
+        content_msg = message.reply_to_message if message.reply_to_message else message
+        text = content_msg.text or content_msg.caption or ""
+        media_info = await BotUtils.save_media(client, content_msg) if content_msg.media else (None, None)
+        
+        message_id = await db.schedule_message({
+            'user_id': user.id,
+            'target': target,
+            'target_type': target_type,
+            'text': text,
+            'media_path': media_info[0] if media_info else None,
+            'media_type': media_info[1] if media_info else None,
+            'scheduled_time': scheduled_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'parse_mode': "markdown"
+        })
+        
+        if not message_id:
+            await message.reply_text("⚠️ Failed to schedule message. Please try again.")
+            return
+        
+        reply_text = f"""
+✅ **Message Scheduled Successfully**
+
+📅 **When**: {scheduled_time.strftime('%Y-%m-%d %H:%M')}
+📩 **To**: {target}
+📝 **Content**: {text[:50] + '...' if len(text) > 50 else text}
+"""
+        if media_info:
+            reply_text += f"📎 **Media**: {media_info[1].capitalize()}\n"
+        
+        reply_text += f"\nID: `{message_id}`"
+        
+        await message.reply_text(
+            reply_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Delete Schedule", callback_data=f"delete_{message_id}")]
+            ])
+        )
+    except Exception as e:
+        logger.error(f"Error in schedule command: {e}")
+        await message.reply_text("⚠️ Failed to schedule message. Please try again.")
+
+# Background Task
+async def scheduled_messages_task():
+    await db.connect()
+    
     while True:
         try:
-            messages = await bot.db.get_pending_messages()
+            messages = await db.get_pending_messages()
             
             for msg in messages:
-                try:
-                    if msg.media_path:
-                        media_path = os.path.join(Config.MEDIA_DIR, msg.media_path)
-                        
-                        if msg.media_type == 'photo':
-                            await bot.send_photo(
-                                chat_id=msg.target,
-                                photo=media_path,
-                                caption=msg.text,
-                                parse_mode=msg.parse_mode
-                            )
-                        elif msg.media_type == 'video':
-                            await bot.send_video(
-                                chat_id=msg.target,
-                                video=media_path,
-                                caption=msg.text,
-                                parse_mode=msg.parse_mode
-                            )
-                        elif msg.media_type == 'document':
-                            await bot.send_document(
-                                chat_id=msg.target,
-                                document=media_path,
-                                caption=msg.text,
-                                parse_mode=msg.parse_mode
-                            )
-                        elif msg.media_type == 'audio':
-                            await bot.send_audio(
-                                chat_id=msg.target,
-                                audio=media_path,
-                                caption=msg.text,
-                                parse_mode=msg.parse_mode
-                            )
-                    else:
-                        await bot.send_message(
-                            chat_id=msg.target,
-                            text=msg.text,
-                            parse_mode=msg.parse_mode
-                        )
-                    
-                    await bot.db.update_message_status(msg.id, 'sent')
-                    logger.log("info", f"Sent message {msg.id} to {msg.target}")
-                    
-                except FloodWait as e:
-                    logger.log("warning", f"Flood wait for {e.value} seconds")
-                    await asyncio.sleep(e.value)
-                    continue
-                except (PeerIdInvalid, ChannelInvalid, ChatAdminRequired, UserNotParticipant) as e:
-                    logger.log("error", f"Invalid target for message {msg.id}: {str(e)}")
-                    await bot.db.update_message_status(msg.id, 'failed')
-                except Exception as e:
-                    logger.log("error", f"Error sending message {msg.id}: {str(e)}")
-                    # Retry logic handled in database query
+                success = await BotUtils.send_message_with_retry(
+                    client=app,
+                    target=msg['target'],
+                    text=msg['text'],
+                    media_path=msg['media_path'],
+                    media_type=msg['media_type'],
+                    parse_mode=msg['parse_mode']
+                )
+                
+                if success:
+                    await db.update_message_status(msg['id'], 'sent')
+                    logger.info(f"Successfully sent message {msg['id']} to {msg['target']}")
+                else:
+                    await db.update_message_status(msg['id'], 'failed')
+                    logger.error(f"Failed to send message {msg['id']} after retries")
             
-            await asyncio.sleep(60)
+            await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
             
         except Exception as e:
-            logger.log("error", f"Error in scheduled messages task: {str(e)}")
-            await asyncio.sleep(60)
+            logger.error(f"Error in scheduled messages task: {e}")
+            await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
 
 # Main Application
 async def main():
-    if not await bot.initialize():
-        logger.log("error", "Bot failed to initialize")
-        return
-    
     try:
-        # Start background tasks
-        asyncio.create_task(process_scheduled_messages())
+        # Initialize database
+        if not await db.connect():
+            logger.error("Failed to connect to database")
+            return
         
-        # Keep the bot running
+        # Start the client
+        await app.start()
+        me = await app.get_me()
+        logger.info(f"Bot started as @{me.username} (ID: {me.id})")
+        
+        # Notify admin
+        for admin_id in Config.ADMIN_IDS:
+            try:
+                await app.send_message(admin_id, "🤖 Bot started successfully!")
+            except Exception as e:
+                logger.error(f"Couldn't notify admin {admin_id}: {e}")
+        
+        # Start background tasks
+        asyncio.create_task(scheduled_messages_task())
+        
+        # Keep running
         while True:
-            await asyncio.sleep(3600)  # Sleep for 1 hour
+            await asyncio.sleep(3600)
             
     except Exception as e:
-        logger.log("error", f"Fatal error in main loop: {str(e)}")
+        logger.error(f"Fatal error in main: {e}")
     finally:
-        await bot.shutdown()
+        await shutdown()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.log("info", "Bot stopped by user")
+        logger.info("Bot stopped by user")
     except Exception as e:
-        logger.log("error", f"Fatal error: {str(e)}")
+        logger.error(f"Fatal error: {e}")
