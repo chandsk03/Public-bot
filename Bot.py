@@ -7,6 +7,7 @@ import signal
 import sys
 from typing import Dict, List, Optional, Union
 import pytz
+import heapq
 from pyrogram import Client, filters, enums
 from pyrogram.types import (
     Message,
@@ -22,6 +23,9 @@ from pyrogram.errors import (
     UserNotParticipant,
     RPCError
 )
+
+# WARNING: Hardcoded credentials are used for simplicity as requested.
+# For production, move API_ID, API_HASH, BOT_TOKEN, and ADMIN_IDS to a secure configuration (e.g., .env file).
 
 # Enhanced Configuration
 class Config:
@@ -42,6 +46,11 @@ class Config:
     CLEANUP_INTERVAL = 24 * 3600  # 1 day
     SPAM_MIN_INTERVAL = 30  # Minimum seconds between spam messages
     MAX_SPAM_DURATION = 24 * 3600  # Max spam duration (1 day)
+    MAX_SPAM_TASKS_PER_USER = 5  # Max active spam tasks per user
+    MAX_SCHEDULED_MESSAGES_PER_USER = 10  # Max scheduled messages per user
+    TASK_COOLDOWN = 60  # Seconds between creating new tasks
+    DB_RETRY_COUNT = 3
+    DB_RETRY_DELAY = 1
 
 # Advanced Logging Setup
 logging.basicConfig(
@@ -62,7 +71,8 @@ class DatabaseManager:
     def __init__(self):
         self.db_path = Config.DB_NAME
         self.conn = None
-        self.lock = asyncio.Lock()
+        self.read_lock = asyncio.Lock()
+        self.write_lock = asyncio.Lock()
 
     async def connect(self):
         try:
@@ -77,79 +87,85 @@ class DatabaseManager:
 
     async def _initialize_database(self):
         try:
-            await self.conn.executescript("""
-                PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=NORMAL;
-                PRAGMA foreign_keys=ON;
+            async with self.write_lock:
+                await self.conn.executescript("""
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA synchronous=NORMAL;
+                    PRAGMA foreign_keys=ON;
 
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    telegram_id INTEGER UNIQUE NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_active TIMESTAMP,
-                    language_code TEXT DEFAULT 'en',
-                    is_admin BOOLEAN DEFAULT FALSE,
-                    is_banned BOOLEAN DEFAULT FALSE
-                );
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telegram_id INTEGER UNIQUE NOT NULL,
+                        username TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_active TIMESTAMP,
+                        language_code TEXT DEFAULT 'en',
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        is_banned BOOLEAN DEFAULT FALSE,
+                        notifications BOOLEAN DEFAULT TRUE,
+                        last_task_time TIMESTAMP
+                    );
 
-                CREATE TABLE IF NOT EXISTS scheduled_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    target TEXT NOT NULL,
-                    target_type TEXT NOT NULL CHECK(target_type IN ('user', 'group', 'channel')),
-                    text TEXT,
-                    media_path TEXT,
-                    media_type TEXT CHECK(media_type IN (NULL, 'photo', 'video', 'document', 'audio')),
-                    parse_mode TEXT DEFAULT 'markdown',
-                    scheduled_time TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed', 'cancelled')),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    retry_count INTEGER DEFAULT 0
-                );
+                    CREATE TABLE IF NOT EXISTS scheduled_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        target TEXT NOT NULL,
+                        target_type TEXT NOT NULL CHECK(target_type IN ('user', 'group', 'channel')),
+                        text TEXT,
+                        media_path TEXT,
+                        media_type TEXT CHECK(media_type IN (NULL, 'photo', 'video', 'document', 'audio')),
+                        parse_mode TEXT DEFAULT 'markdown',
+                        scheduled_time TIMESTAMP NOT NULL,
+                        status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'sent', 'failed', 'cancelled')),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        retry_count INTEGER DEFAULT 0
+                    );
 
-                CREATE TABLE IF NOT EXISTS spam_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    target TEXT NOT NULL,
-                    target_type TEXT NOT NULL CHECK(target_type IN ('user', 'group', 'channel')),
-                    text TEXT,
-                    media_path TEXT,
-                    media_type TEXT CHECK(media_type IN (NULL, 'photo', 'video', 'document', 'audio')),
-                    parse_mode TEXT DEFAULT 'markdown',
-                    interval INTEGER NOT NULL,
-                    end_time TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'active' CHECK(status IN ('active', 'stopped', 'completed')),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+                    CREATE TABLE IF NOT EXISTS spam_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        target TEXT NOT NULL,
+                        target_type TEXT NOT NULL CHECK(target_type IN ('user', 'group', 'channel')),
+                        text TEXT,
+                        media_path TEXT,
+                        media_type TEXT CHECK(media_type IN (NULL, 'photo', 'video', 'document', 'audio')),
+                        parse_mode TEXT DEFAULT 'markdown',
+                        interval INTEGER NOT NULL,
+                        end_time TIMESTAMP NOT NULL,
+                        next_send_time TIMESTAMP NOT NULL,
+                        priority INTEGER DEFAULT 0,
+                        status TEXT DEFAULT 'active' CHECK(status IN ('active', 'stopped', 'completed')),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
 
-                CREATE TABLE IF NOT EXISTS group_participation (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    group_link TEXT NOT NULL,
-                    group_title TEXT,
-                    group_id INTEGER,
-                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'joined' CHECK(status IN ('joined', 'left', 'banned', 'kicked'))
-                );
+                    CREATE TABLE IF NOT EXISTS group_participation (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        group_link TEXT NOT NULL,
+                        group_title TEXT,
+                        group_id INTEGER,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        status TEXT DEFAULT 'joined' CHECK(status IN ('joined', 'left', 'banned', 'kicked'))
+                    );
 
-                CREATE TABLE IF NOT EXISTS bot_usage (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL REFERENCES users(id),
-                    command TEXT NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    details TEXT
-                );
+                    CREATE TABLE IF NOT EXISTS bot_usage (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        command TEXT NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        details TEXT
+                    );
 
-                CREATE INDEX IF NOT EXISTS idx_scheduled_status ON scheduled_messages(status);
-                CREATE INDEX IF NOT EXISTS idx_scheduled_time ON scheduled_messages(scheduled_time);
-                CREATE INDEX IF NOT EXISTS idx_spam_status ON spam_tasks(status);
-                CREATE INDEX IF NOT EXISTS idx_user_active ON users(last_active);
-                CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON bot_usage(timestamp);
-            """)
-            await self.conn.commit()
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_status ON scheduled_messages(status);
+                    CREATE INDEX IF NOT EXISTS idx_scheduled_time ON scheduled_messages(scheduled_time);
+                    CREATE INDEX IF NOT EXISTS idx_spam_status ON spam_tasks(status);
+                    CREATE INDEX IF NOT EXISTS idx_spam_next_send ON spam_tasks(next_send_time);
+                    CREATE INDEX IF NOT EXISTS idx_user_active ON users(last_active);
+                    CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON bot_usage(timestamp);
+                """)
+                await self.conn.commit()
             logger.info("Database tables initialized")
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
@@ -163,226 +179,294 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Error closing database: {e}")
 
+    async def execute_with_retry(self, query: str, params: tuple = (), is_select: bool = False):
+        for attempt in range(Config.DB_RETRY_COUNT):
+            try:
+                lock = self.read_lock if is_select else self.write_lock
+                async with lock:
+                    cursor = await self.conn.execute(query, params)
+                    if is_select:
+                        return cursor
+                    await self.conn.commit()
+                    return cursor
+            except Exception as e:
+                logger.error(f"Database attempt {attempt + 1} failed: {e}")
+                if attempt < Config.DB_RETRY_COUNT - 1:
+                    await asyncio.sleep(Config.DB_RETRY_DELAY)
+                else:
+                    raise
+
     async def create_or_update_user(self, user_data: Dict) -> bool:
         try:
-            async with self.lock:
-                is_admin = 1 if user_data['id'] in Config.ADMIN_IDS else 0
-                await self.conn.execute(
-                    """INSERT INTO users 
-                    (telegram_id, username, first_name, last_name, language_code, last_active, is_admin)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-                    ON CONFLICT(telegram_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
-                    last_name = excluded.last_name,
-                    language_code = excluded.language_code,
-                    last_active = CURRENT_TIMESTAMP""",
-                    (user_data['id'], user_data.get('username'), 
-                     user_data.get('first_name'), user_data.get('last_name'),
-                     user_data.get('language_code', 'en'), is_admin)
-                )
-                await self.conn.commit()
-                return True
+            is_admin = 1 if user_data['id'] in Config.ADMIN_IDS else 0
+            query = """
+                INSERT INTO users 
+                (telegram_id, username, first_name, last_name, language_code, last_active, is_admin)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                username = excluded.username,
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                language_code = excluded.language_code,
+                last_active = CURRENT_TIMESTAMP
+            """
+            await self.execute_with_retry(query, (
+                user_data['id'], user_data.get('username'), 
+                user_data.get('first_name'), user_data.get('last_name'),
+                user_data.get('language_code', 'en'), is_admin
+            ))
+            return True
         except Exception as e:
             logger.error(f"Error creating/updating user: {e}")
             return False
 
+    async def update_last_task_time(self, user_id: int):
+        try:
+            query = "UPDATE users SET last_task_time = CURRENT_TIMESTAMP WHERE telegram_id = ?"
+            await self.execute_with_retry(query, (user_id,))
+            return True
+        except Exception as e:
+            logger.error(f"Error updating last task time for user {user_id}: {e}")
+            return False
+
+    async def get_last_task_time(self, user_id: int) -> Optional[datetime.datetime]:
+        try:
+            query = "SELECT last_task_time FROM users WHERE telegram_id = ?"
+            cursor = await self.execute_with_retry(query, (user_id,), is_select=True)
+            row = await cursor.fetchone()
+            if row and row['last_task_time']:
+                return datetime.datetime.strptime(row['last_task_time'], "%Y-%m-%d %H:%M:%S")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting last task time for user {user_id}: {e}")
+            return None
+
     async def ban_user(self, telegram_id: int) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    "UPDATE users SET is_banned = 1 WHERE telegram_id = ?",
-                    (telegram_id,)
-                )
-                await self.conn.commit()
-                return True
+            query = "UPDATE users SET is_banned = 1 WHERE telegram_id = ?"
+            await self.execute_with_retry(query, (telegram_id,))
+            return True
         except Exception as e:
             logger.error(f"Error banning user {telegram_id}: {e}")
             return False
 
     async def unban_user(self, telegram_id: int) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    "UPDATE users SET is_banned = 0 WHERE telegram_id = ?",
-                    (telegram_id,)
-                )
-                await self.conn.commit()
-                return True
+            query = "UPDATE users SET is_banned = 0 WHERE telegram_id = ?"
+            await self.execute_with_retry(query, (telegram_id,))
+            return True
         except Exception as e:
             logger.error(f"Error unbanning user {telegram_id}: {e}")
             return False
 
+    async def toggle_notifications(self, telegram_id: int, enabled: bool) -> bool:
+        try:
+            query = "UPDATE users SET notifications = ? WHERE telegram_id = ?"
+            await self.execute_with_retry(query, (1 if enabled else 0, telegram_id))
+            return True
+        except Exception as e:
+            logger.error(f"Error toggling notifications for user {telegram_id}: {e}")
+            return False
+
+    async def get_user_settings(self, telegram_id: int) -> Dict:
+        try:
+            query = "SELECT notifications FROM users WHERE telegram_id = ?"
+            cursor = await self.execute_with_retry(query, (telegram_id,), is_select=True)
+            row = await cursor.fetchone()
+            return {'notifications': bool(row['notifications']) if row else True}
+        except Exception as e:
+            logger.error(f"Error getting settings for user {telegram_id}: {e}")
+            return {'notifications': True}
+
     async def is_user_banned(self, telegram_id: int) -> bool:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    "SELECT is_banned FROM users WHERE telegram_id = ?",
-                    (telegram_id,)
-                )
-                row = await cursor.fetchone()
-                return row and row['is_banned']
+            query = "SELECT is_banned FROM users WHERE telegram_id = ?"
+            cursor = await self.execute_with_retry(query, (telegram_id,), is_select=True)
+            row = await cursor.fetchone()
+            return row and row['is_banned']
         except Exception as e:
             logger.error(f"Error checking ban status for {telegram_id}: {e}")
             return False
 
     async def schedule_message(self, data: Dict) -> Optional[int]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """INSERT INTO scheduled_messages 
-                    (user_id, target, target_type, text, media_path, media_type, parse_mode, scheduled_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (data['user_id'], data['target'], data['target_type'], data['text'],
-                     data.get('media_path'), data.get('media_type'), 
-                     data.get('parse_mode', 'markdown'), data['scheduled_time'])
-                )
-                await self.conn.commit()
-                return cursor.lastrowid
+            query = """
+                INSERT INTO scheduled_messages 
+                (user_id, target, target_type, text, media_path, media_type, parse_mode, scheduled_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            cursor = await self.execute_with_retry(query, (
+                data['user_id'], data['target'], data['target_type'], data['text'],
+                data.get('media_path'), data.get('media_type'), 
+                data.get('parse_mode', 'markdown'), data['scheduled_time']
+            ))
+            return cursor.lastrowid
         except Exception as e:
             logger.error(f"Error scheduling message: {e}")
             return None
 
     async def create_spam_task(self, data: Dict) -> Optional[int]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """INSERT INTO spam_tasks 
-                    (user_id, target, target_type, text, media_path, media_type, parse_mode, interval, end_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (data['user_id'], data['target'], data['target_type'], data['text'],
-                     data.get('media_path'), data.get('media_type'), 
-                     data.get('parse_mode', 'markdown'), data['interval'], data['end_time'])
-                )
-                await self.conn.commit()
-                return cursor.lastrowid
+            query = """
+                INSERT INTO spam_tasks 
+                (user_id, target, target_type, text, media_path, media_type, parse_mode, 
+                 interval, end_time, next_send_time, priority)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            cursor = await self.execute_with_retry(query, (
+                data['user_id'], data['target'], data['target_type'], data['text'],
+                data.get('media_path'), data.get('media_type'), 
+                data.get('parse_mode', 'markdown'), data['interval'], 
+                data['end_time'], data['next_send_time'], data.get('priority', 0)
+            ))
+            return cursor.lastrowid
         except Exception as e:
             logger.error(f"Error creating spam task: {e}")
             return None
 
     async def get_pending_messages(self) -> List[Dict]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """SELECT * FROM scheduled_messages
-                    WHERE status = 'pending' AND scheduled_time <= datetime('now')
-                    ORDER BY scheduled_time ASC
-                    LIMIT 100"""
-                )
-                return [dict(row) for row in await cursor.fetchall()]
+            query = """
+                SELECT * FROM scheduled_messages
+                WHERE status = 'pending' AND scheduled_time <= datetime('now')
+                ORDER BY scheduled_time ASC
+                LIMIT 100
+            """
+            cursor = await self.execute_with_retry(query, is_select=True)
+            return [dict(row) for row in await cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting pending messages: {e}")
             return []
 
     async def get_active_spam_tasks(self) -> List[Dict]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """SELECT * FROM spam_tasks
-                    WHERE status = 'active' AND end_time > datetime('now')
-                    ORDER BY created_at ASC"""
-                )
-                return [dict(row) for row in await cursor.fetchall()]
+            query = """
+                SELECT * FROM spam_tasks
+                WHERE status = 'active' AND end_time > datetime('now')
+                ORDER BY priority DESC, next_send_time ASC
+            """
+            cursor = await self.execute_with_retry(query, is_select=True)
+            return [dict(row) for row in await cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting active spam tasks: {e}")
             return []
 
+    async def update_spam_task_next_send(self, task_id: int, next_send_time: str):
+        try:
+            query = "UPDATE spam_tasks SET next_send_time = ? WHERE id = ?"
+            await self.execute_with_retry(query, (next_send_time, task_id))
+            return True
+        except Exception as e:
+            logger.error(f"Error updating spam task {task_id} next send time: {e}")
+            return False
+
+    async def set_spam_task_priority(self, task_id: int, priority: int) -> bool:
+        try:
+            query = "UPDATE spam_tasks SET priority = ? WHERE id = ?"
+            await self.execute_with_retry(query, (priority, task_id))
+            return True
+        except Exception as e:
+            logger.error(f"Error setting priority for spam task {task_id}: {e}")
+            return False
+
     async def stop_spam_task(self, task_id: int) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    "UPDATE spam_tasks SET status = 'stopped' WHERE id = ?",
-                    (task_id,)
-                )
-                await self.conn.commit()
-                return True
+            query = "UPDATE spam_tasks SET status = 'stopped' WHERE id = ?"
+            await self.execute_with_retry(query, (task_id,))
+            return True
         except Exception as e:
             logger.error(f"Error stopping spam task {task_id}: {e}")
             return False
 
+    async def stop_all_spam_tasks(self, user_id: Optional[int] = None) -> bool:
+        try:
+            if user_id:
+                query = "UPDATE spam_tasks SET status = 'stopped' WHERE user_id = ? AND status = 'active'"
+                params = (user_id,)
+            else:
+                query = "UPDATE spam_tasks SET status = 'stopped' WHERE status = 'active'"
+                params = ()
+            await self.execute_with_retry(query, params)
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping all spam tasks: {e}")
+            return False
+
     async def update_message_status(self, message_id: int, status: str) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    "UPDATE scheduled_messages SET status = ? WHERE id = ?",
-                    (status, message_id)
-                )
-                await self.conn.commit()
-                return True
+            query = "UPDATE scheduled_messages SET status = ? WHERE id = ?"
+            await self.execute_with_retry(query, (status, message_id))
+            return True
         except Exception as e:
             logger.error(f"Error updating message status: {e}")
             return False
 
     async def get_user_scheduled_messages(self, user_id: int) -> List[Dict]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """SELECT * FROM scheduled_messages
-                    WHERE user_id = ? AND status = 'pending'
-                    ORDER BY scheduled_time ASC""",
-                    (user_id,)
-                )
-                return [dict(row) for row in await cursor.fetchall()]
+            query = """
+                SELECT * FROM scheduled_messages
+                WHERE user_id = ? AND status = 'pending'
+                ORDER BY scheduled_time ASC
+            """
+            cursor = await self.execute_with_retry(query, (user_id,), is_select=True)
+            return [dict(row) for row in await cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting user scheduled messages: {e}")
             return []
 
     async def get_user_spam_tasks(self, user_id: int) -> List[Dict]:
         try:
-            async with self.lock:
-                cursor = await self.conn.execute(
-                    """SELECT * FROM spam_tasks
-                    WHERE user_id = ? AND status = 'active'
-                    ORDER BY created_at ASC""",
-                    (user_id,)
-                )
-                return [dict(row) for row in await cursor.fetchall()]
+            query = """
+                SELECT * FROM spam_tasks
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY created_at ASC
+            """
+            cursor = await self.execute_with_retry(query, (user_id,), is_select=True)
+            return [dict(row) for row in await cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting user spam tasks: {e}")
             return []
 
+    async def count_user_tasks(self, user_id: int, table: str) -> int:
+        try:
+            query = f"SELECT COUNT(*) as count FROM {table} WHERE user_id = ? AND status = 'active'"
+            cursor = await self.execute_with_retry(query, (user_id,), is_select=True)
+            row = await cursor.fetchone()
+            return row['count']
+        except Exception as e:
+            logger.error(f"Error counting tasks for user {user_id}: {e}")
+            return 0
+
     async def cancel_scheduled_message(self, message_id: int) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    "UPDATE scheduled_messages SET status = 'cancelled' WHERE id = ?",
-                    (message_id,)
-                )
-                await self.conn.commit()
-                return True
+            query = "UPDATE scheduled_messages SET status = 'cancelled' WHERE id = ?"
+            await self.execute_with_retry(query, (message_id,))
+            return True
         except Exception as e:
             logger.error(f"Error cancelling scheduled message: {e}")
             return False
 
     async def log_usage(self, user_id: int, command: str, details: Optional[str] = None) -> bool:
         try:
-            async with self.lock:
-                await self.conn.execute(
-                    """INSERT INTO bot_usage (user_id, command, details)
-                    VALUES (?, ?, ?)""",
-                    (user_id, command, details)
-                )
-                await self.conn.commit()
-                return True
+            query = """INSERT INTO bot_usage (user_id, command, details) VALUES (?, ?, ?)"""
+            await self.execute_with_retry(query, (user_id, command, details))
+            return True
         except Exception as e:
             logger.error(f"Error logging usage: {e}")
             return False
 
     async def get_usage_stats(self, start_date: str, end_date: str) -> Dict:
         try:
-            async with self.lock:
-                # Total users
+            async with self.read_lock:
                 cursor = await self.conn.execute("SELECT COUNT(*) as count FROM users")
                 total_users = (await cursor.fetchone())['count']
 
-                # Active users (last 24 hours)
                 cursor = await self.conn.execute(
                     """SELECT COUNT(DISTINCT telegram_id) as count FROM users
                     WHERE last_active > datetime('now', '-24 hours')"""
                 )
                 active_users = (await cursor.fetchone())['count']
 
-                # Command usage
                 cursor = await self.conn.execute(
                     """SELECT command, COUNT(*) as count FROM bot_usage
                     WHERE timestamp BETWEEN ? AND ?
@@ -391,7 +475,6 @@ class DatabaseManager:
                 )
                 command_usage = {row['command']: row['count'] for row in await cursor.fetchall()}
 
-                # Spam tasks
                 cursor = await self.conn.execute(
                     """SELECT COUNT(*) as count FROM spam_tasks
                     WHERE created_at BETWEEN ? AND ?""",
@@ -399,11 +482,25 @@ class DatabaseManager:
                 )
                 spam_tasks = (await cursor.fetchone())['count']
 
+                cursor = await self.conn.execute(
+                    """SELECT COUNT(*) as count FROM scheduled_messages
+                    WHERE status = 'pending'"""
+                )
+                pending_messages = (await cursor.fetchone())['count']
+
+                cursor = await self.conn.execute(
+                    """SELECT COUNT(*) as count FROM spam_tasks
+                    WHERE status = 'active'"""
+                )
+                active_spam_tasks = (await cursor.fetchone())['count']
+
                 return {
                     'total_users': total_users,
                     'active_users': active_users,
                     'command_usage': command_usage,
-                    'spam_tasks': spam_tasks
+                    'spam_tasks': spam_tasks,
+                    'pending_messages': pending_messages,
+                    'active_spam_tasks': active_spam_tasks
                 }
         except Exception as e:
             logger.error(f"Error getting usage stats: {e}")
@@ -565,6 +662,15 @@ class BotUtils:
             logger.error(f"Error validating target {target}: {e}")
             return False
 
+    @staticmethod
+    async def notify_user(client: Client, user_id: int, message: str):
+        settings = await db.get_user_settings(user_id)
+        if settings['notifications']:
+            try:
+                await client.send_message(user_id, message)
+            except Exception as e:
+                logger.error(f"Error notifying user {user_id}: {e}")
+
 # Initialize Pyrogram Client
 app = Client(
     name="advanced_bot",
@@ -625,7 +731,9 @@ async def start_command(client: Client, message: Message):
             [InlineKeyboardButton("📅 Schedule Message", callback_data="schedule")],
             [InlineKeyboardButton("📊 My Scheduled", callback_data="my_scheduled")],
             [InlineKeyboardButton("📩 Start Spamming", callback_data="spam")],
+            [InlineKeyboardButton("📊 My Spam Tasks", callback_data="my_spam")],
             [InlineKeyboardButton("➕ Join Group", callback_data="join_group")],
+            [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
             [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
         ])
 
@@ -635,7 +743,7 @@ async def start_command(client: Client, message: Message):
             "- Schedule one-time messages with text/media\n"
             "- Send repeated messages (spam) on a timer\n"
             "- Auto-join groups/channels\n"
-            "- Manage your communications\n\n"
+            "- Customize your settings\n\n"
             "Select an option below to get started:",
             reply_markup=keyboard
         )
@@ -650,6 +758,19 @@ async def schedule_command(client: Client, message: Message):
 
         if await db.is_user_banned(user.id):
             await message.reply_text("🚫 You are banned from using this bot.")
+            return
+
+        # Check task limits
+        scheduled_count = await db.count_user_tasks(user.id, "scheduled_messages")
+        if scheduled_count >= Config.MAX_SCHEDULED_MESSAGES_PER_USER:
+            await message.reply_text(f"⚠️ You have reached the limit of {Config.MAX_SCHEDULED_MESSAGES_PER_USER} scheduled messages.")
+            return
+
+        # Check cooldown
+        last_task_time = await db.get_last_task_time(user.id)
+        now = datetime.datetime.now(BotUtils.get_timezone())
+        if last_task_time and (now - last_task_time).total_seconds() < Config.TASK_COOLDOWN:
+            await message.reply_text(f"⏳ Please wait {Config.TASK_COOLDOWN} seconds between creating tasks.")
             return
 
         if not message.reply_to_message and not (message.text or message.caption):
@@ -704,6 +825,7 @@ async def schedule_command(client: Client, message: Message):
             await message.reply_text("⚠️ Failed to schedule message. Please try again.")
             return
 
+        await db.update_last_task_time(user.id)
         await db.log_usage(user.id, "/schedule", f"Scheduled message ID: {message_id}")
 
         reply_text = f"""
@@ -735,6 +857,19 @@ async def spam_command(client: Client, message: Message):
 
         if await db.is_user_banned(user.id):
             await message.reply_text("🚫 You are banned from using this bot.")
+            return
+
+        # Check task limits
+        spam_count = await db.count_user_tasks(user.id, "spam_tasks")
+        if spam_count >= Config.MAX_SPAM_TASKS_PER_USER:
+            await message.reply_text(f"⚠️ You have reached the limit of {Config.MAX_SPAM_TASKS_PER_USER} spam tasks.")
+            return
+
+        # Check cooldown
+        last_task_time = await db.get_last_task_time(user.id)
+        now = datetime.datetime.now(BotUtils.get_timezone())
+        if last_task_time and (now - last_task_time).total_seconds() < Config.TASK_COOLDOWN:
+            await message.reply_text(f"⏳ Please wait {Config.TASK_COOLDOWN} seconds between creating tasks.")
             return
 
         if not message.reply_to_message and not (message.text or message.caption):
@@ -777,7 +912,8 @@ async def spam_command(client: Client, message: Message):
         text = content_msg.text or content_msg.caption or ""
         media_info = await BotUtils.save_media(client, content_msg) if content_msg.media else (None, None)
 
-        end_time = datetime.datetime.now(BotUtils.get_timezone()) + datetime.timedelta(hours=duration)
+        end_time = now + datetime.timedelta(hours=duration)
+        next_send_time = now
 
         task_id = await db.create_spam_task({
             'user_id': user.id,
@@ -788,6 +924,7 @@ async def spam_command(client: Client, message: Message):
             'media_type': media_info[1] if media_info else None,
             'interval': interval,
             'end_time': end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'next_send_time': next_send_time.strftime("%Y-%m-%d %H:%M:%S"),
             'parse_mode': "markdown"
         })
 
@@ -795,6 +932,7 @@ async def spam_command(client: Client, message: Message):
             await message.reply_text("⚠️ Failed to start spam task. Please try again.")
             return
 
+        await db.update_last_task_time(user.id)
         await db.log_usage(user.id, "/spam", f"Spam task ID: {task_id}")
 
         reply_text = f"""
@@ -838,12 +976,11 @@ async def join_command(client: Client, message: Message):
         link = args[0]
         try:
             chat = await client.join_chat(link)
-            await db.conn.execute(
+            await db.execute_with_retry(
                 """INSERT INTO group_participation (user_id, group_link, group_title, group_id, status)
                 VALUES (?, ?, ?, ?, 'joined')""",
                 (user.id, link, chat.title, chat.id)
             )
-            await db.conn.commit()
             await db.log_usage(user.id, "/join", f"Joined group: {chat.title}")
             await message.reply_text(f"✅ Successfully joined {chat.title}!")
         except Exception as e:
@@ -851,6 +988,73 @@ async def join_command(client: Client, message: Message):
             await message.reply_text("⚠️ Failed to join the group/channel. Please check the link and try again.")
     except Exception as e:
         logger.error(f"Error in join command: {e}")
+        await message.reply_text("⚠️ An error occurred. Please try again later.")
+
+@app.on_message(filters.command("settings"))
+async def settings_command(client: Client, message: Message):
+    try:
+        user = message.from_user
+
+        if await db.is_user_banned(user.id):
+            await message.reply_text("🚫 You are banned from using this bot.")
+            return
+
+        settings = await db.get_user_settings(user.id)
+        notifications = settings['notifications']
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    f"Notifications: {'On' if notifications else 'Off'}",
+                    callback_data="toggle_notifications"
+                )
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="back")]
+        ])
+
+        await message.reply_text(
+            "⚙️ **Settings**\n\n"
+            "Customize your preferences below:",
+            reply_markup=keyboard
+        )
+        await db.log_usage(user.id, "/settings")
+    except Exception as e:
+        logger.error(f"Error in settings command: {e}")
+        await message.reply_text("⚠️ An error occurred. Please try again later.")
+
+@app.on_message(filters.command("status"))
+async def status_command(client: Client, message: Message):
+    try:
+        user = message.from_user
+
+        if await db.is_user_banned(user.id):
+            await message.reply_text("🚫 You are banned from using this bot.")
+            return
+
+        scheduled_count = await db.count_user_tasks(user.id, "scheduled_messages")
+        spam_count = await db.count_user_tasks(user.id, "spam_tasks")
+
+        reply_text = f"📈 **Your Status**\n\n"
+        reply_text += f"📅 Scheduled Messages: {scheduled_count}/{Config.MAX_SCHEDULED_MESSAGES_PER_USER}\n"
+        reply_text += f"📩 Spam Tasks: {spam_count}/{Config.MAX_SPAM_TASKS_PER_USER}\n"
+
+        if user.id in Config.ADMIN_IDS:
+            now = datetime.datetime.now(BotUtils.get_timezone())
+            start_date = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            end_date = now.strftime("%Y-%m-%d %H:%M:%S")
+            stats = await db.get_usage_stats(start_date, end_date)
+            reply_text += (
+                "\n🔧 **Admin Stats**\n"
+                f"👥 Total Users: {stats.get('total_users', 0)}\n"
+                f"🟢 Active Users (24h): {stats.get('active_users', 0)}\n"
+                f"📅 Pending Messages: {stats.get('pending_messages', 0)}\n"
+                f"📩 Active Spam Tasks: {stats.get('active_spam_tasks', 0)}\n"
+            )
+
+        await message.reply_text(reply_text)
+        await db.log_usage(user.id, "/status")
+    except Exception as e:
+        logger.error(f"Error in status command: {e}")
         await message.reply_text("⚠️ An error occurred. Please try again later.")
 
 # Admin Commands
@@ -915,7 +1119,7 @@ async def broadcast_command(client: Client, message: Message):
         text = content_msg.text or content_msg.caption or ""
         media_info = await BotUtils.save_media(client, content_msg) if content_msg.media else (None, None)
 
-        cursor = await db.conn.execute("SELECT telegram_id FROM users WHERE is_banned = 0")
+        cursor = await db.execute_with_retry("SELECT telegram_id FROM users WHERE is_banned = 0", is_select=True)
         users = [row['telegram_id'] for row in await cursor.fetchall()]
         success_count = 0
         fail_count = 0
@@ -959,6 +1163,8 @@ async def stats_command(client: Client, message: Message):
             f"📊 **Bot Usage Statistics** (Last 7 Days)\n\n"
             f"👥 **Total Users**: {stats.get('total_users', 0)}\n"
             f"🟢 **Active Users (24h)**: {stats.get('active_users', 0)}\n"
+            f"📅 **Pending Messages**: {stats.get('pending_messages', 0)}\n"
+            f"📩 **Active Spam Tasks**: {stats.get('active_spam_tasks', 0)}\n"
             f"📩 **Spam Tasks Created**: {stats.get('spam_tasks', 0)}\n"
             f"📋 **Command Usage**:\n"
         )
@@ -970,6 +1176,52 @@ async def stats_command(client: Client, message: Message):
     except Exception as e:
         logger.error(f"Error in stats command: {e}")
         await message.reply_text("⚠️ Failed to retrieve statistics.")
+
+@app.on_message(filters.command("stopall") & filters.user(Config.ADMIN_IDS))
+async def stopall_command(client: Client, message: Message):
+    try:
+        args = message.text.split()[1:]
+        user_id = int(args[0]) if args else None
+
+        if user_id and user_id in Config.ADMIN_IDS and user_id != message.from_user.id:
+            await message.reply_text("Cannot stop tasks for another admin!")
+            return
+
+        if await db.stop_all_spam_tasks(user_id):
+            target = f"for user {user_id}" if user_id else "globally"
+            await message.reply_text(f"✅ All spam tasks stopped {target}.")
+            await db.log_usage(message.from_user.id, "/stopall", f"Stopped tasks {target}")
+        else:
+            await message.reply_text("⚠️ Failed to stop spam tasks.")
+    except ValueError:
+        await message.reply_text("Usage: `/stopall [user_id]`")
+    except Exception as e:
+        logger.error(f"Error in stopall command: {e}")
+        await message.reply_text("⚠️ An error occurred. Please try again later.")
+
+@app.on_message(filters.command("priority") & filters.user(Config.ADMIN_IDS))
+async def priority_command(client: Client, message: Message):
+    try:
+        args = message.text.split()[1:]
+        if len(args) < 2:
+            await message.reply_text("Usage: `/priority <task_id> <priority>`")
+            return
+
+        try:
+            task_id = int(args[0])
+            priority = int(args[1])
+        except ValueError:
+            await message.reply_text("Task ID and priority must be numbers.")
+            return
+
+        if await db.set_spam_task_priority(task_id, priority):
+            await message.reply_text(f"✅ Priority set to {priority} for task {task_id}.")
+            await db.log_usage(message.from_user.id, "/priority", f"Set priority {priority} for task {task_id}")
+        else:
+            await message.reply_text("⚠️ Failed to set priority.")
+    except Exception as e:
+        logger.error(f"Error in priority command: {e}")
+        await message.reply_text("⚠️ An error occurred. Please try again later.")
 
 # Callback Query Handlers
 @app.on_callback_query()
@@ -1044,6 +1296,42 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
                 "`/join https://t.me/group_link`"
             )
 
+        elif data == "settings":
+            settings = await db.get_user_settings(user.id)
+            notifications = settings['notifications']
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"Notifications: {'On' if notifications else 'Off'}",
+                        callback_data="toggle_notifications"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="back")]
+            ])
+            await callback_query.message.edit_text(
+                "⚙️ **Settings**\n\nCustomize your preferences below:",
+                reply_markup=keyboard
+            )
+
+        elif data == "toggle_notifications":
+            settings = await db.get_user_settings(user.id)
+            new_value = not settings['notifications']
+            await db.toggle_notifications(user.id, new_value)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        f"Notifications: {'On' if new_value else 'Off'}",
+                        callback_data="toggle_notifications"
+                    )
+                ],
+                [InlineKeyboardButton("🔙 Back", callback_data="back")]
+            ])
+            await callback_query.message.edit_text(
+                f"✅ Notifications {'enabled' if new_value else 'disabled'}.",
+                reply_markup=keyboard
+            )
+            await db.log_usage(user.id, "toggle_notifications")
+
         elif data == "help":
             await callback_query.message.edit_text(
                 "ℹ️ **Help**\n\n"
@@ -1051,12 +1339,16 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
                 "- `/start`: Start the bot\n"
                 "- `/schedule`: Schedule a one-time message\n"
                 "- `/spam`: Start a repeating message\n"
-                "- `/join`: Join a group or channel\n\n"
+                "- `/join`: Join a group or channel\n"
+                "- `/settings`: Customize preferences\n"
+                "- `/status`: View your tasks and limits\n\n"
                 "Admin commands:\n"
                 "- `/ban <user_id>`: Ban a user\n"
                 "- `/unban <user_id>`: Unban a user\n"
                 "- `/broadcast`: Send a message to all users\n"
-                "- `/stats`: View bot usage statistics\n\n"
+                "- `/stats`: View bot usage statistics\n"
+                "- `/stopall [user_id]`: Stop all spam tasks\n"
+                "- `/priority <task_id> <priority>`: Set task priority\n\n"
                 "Use the buttons to navigate.",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Back", callback_data="back")]
@@ -1075,6 +1367,7 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
             task_id = int(data.split("_")[2])
             if await db.stop_spam_task(task_id):
                 await callback_query.message.edit_text("✅ Spam task stopped successfully!")
+                await BotUtils.notify_user(client, user.id, f"📩 Spam task `{task_id}` has been stopped.")
                 await db.log_usage(user.id, "stop_spam", f"Stopped spam task ID: {task_id}")
             else:
                 await callback_query.message.edit_text("⚠️ Failed to stop spam task.")
@@ -1086,6 +1379,7 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
                 [InlineKeyboardButton("📩 Start Spamming", callback_data="spam")],
                 [InlineKeyboardButton("📊 My Spam Tasks", callback_data="my_spam")],
                 [InlineKeyboardButton("➕ Join Group", callback_data="join_group")],
+                [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
                 [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
             ])
             await callback_query.message.edit_text(
@@ -1100,16 +1394,14 @@ async def handle_callback_query(client: Client, callback_query: CallbackQuery):
         await callback_query.message.reply_text("⚠️ An error occurred. Please try again later.")
 
 # Background Tasks
-async def scheduled_messages_task():
-    await db.connect()
-
+async def scheduled_messages_task(client: Client):
     while True:
         try:
             messages = await db.get_pending_messages()
 
             for msg in messages:
                 success = await BotUtils.send_message_with_retry(
-                    client=app,
+                    client=client,
                     target=msg['target'],
                     text=msg['text'],
                     media_path=msg['media_path'],
@@ -1119,9 +1411,11 @@ async def scheduled_messages_task():
 
                 if success:
                     await db.update_message_status(msg['id'], 'sent')
+                    await BotUtils.notify_user(client, msg['user_id'], f"✅ Scheduled message `{msg['id']}` sent to {msg['target']}.")
                     logger.info(f"Successfully sent message {msg['id']} to {msg['target']}")
                 else:
                     await db.update_message_status(msg['id'], 'failed')
+                    await BotUtils.notify_user(client, msg['user_id'], f"⚠️ Scheduled message `{msg['id']}` failed to send to {msg['target']}.")
                     logger.error(f"Failed to send message {msg['id']} after retries")
 
             await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
@@ -1130,22 +1424,51 @@ async def scheduled_messages_task():
             logger.error(f"Error in scheduled messages task: {e}")
             await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
 
-async def spam_messages_task():
-    while True:
-        try:
-            tasks = await db.get_active_spam_tasks()
+async def spam_messages_task(client: Client):
+    task_queue = []
+    last_db_check = None
+    db_check_interval = 60  # seconds
 
-            for task in tasks:
-                last_sent = datetime.datetime.now(BotUtils.get_timezone())
+    def task_key(task):
+        return (task['next_send_time'], -task['priority'], task['id'])
+
+    async def load_tasks():
+        tasks = await db.get_active_spam_tasks()
+        for task in tasks:
+            next_send = datetime.datetime.strptime(task['next_send_time'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=BotUtils.get_timezone())
+            heapq.heappush(task_queue, (next_send.timestamp(), task))
+
+    try:
+        await load_tasks()
+        while True:
+            now = datetime.datetime.now(BotUtils.get_timezone())
+
+            # Refresh tasks periodically
+            if not last_db_check or (now - last_db_check).total_seconds() >= db_check_interval:
+                task_queue.clear()
+                await load_tasks()
+                last_db_check = now
+                logger.debug("Refreshed spam tasks from database")
+
+            if not task_queue:
+                await asyncio.sleep(1)
+                continue
+
+            next_send_ts, task = task_queue[0]
+            next_send = datetime.datetime.fromtimestamp(next_send_ts, tz=BotUtils.get_timezone())
+
+            if now >= next_send:
+                heapq.heappop(task_queue)
                 end_time = datetime.datetime.strptime(task['end_time'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=BotUtils.get_timezone())
 
-                if last_sent >= end_time:
+                if now >= end_time:
                     await db.stop_spam_task(task['id'])
+                    await BotUtils.notify_user(client, task['user_id'], f"🏁 Spam task `{task['id']}` has completed.")
                     logger.info(f"Spam task {task['id']} completed")
                     continue
 
                 success = await BotUtils.send_message_with_retry(
-                    client=app,
+                    client=client,
                     target=task['target'],
                     text=task['text'],
                     media_path=task['media_path'],
@@ -1154,15 +1477,23 @@ async def spam_messages_task():
                 )
 
                 if success:
+                    next_send = now + datetime.timedelta(seconds=task['interval'])
+                    await db.update_spam_task_next_send(task['id'], next_send.strftime("%Y-%m-%d %H:%M:%S"))
+                    task['next_send_time'] = next_send.strftime("%Y-%m-%d %H:%M:%S")
+                    heapq.heappush(task_queue, (next_send.timestamp(), task))
                     logger.debug(f"Sent spam message for task {task['id']} to {task['target']}")
                 else:
+                    await BotUtils.notify_user(client, task['user_id'], f"⚠️ Spam task `{task['id']}` failed to send to {task['target']}.")
                     logger.error(f"Failed to send spam message for task {task['id']} to {task['target']}")
 
-                await asyncio.sleep(task['interval'])
+            else:
+                sleep_duration = (next_send - now).total_seconds()
+                if sleep_duration > 0:
+                    await asyncio.sleep(min(sleep_duration, 1))
 
-        except Exception as e:
-            logger.error(f"Error in spam messages task: {e}")
-            await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
+    except Exception as e:
+        logger.error(f"Error in spam messages task: {e}")
+        await asyncio.sleep(Config.SCHEDULE_CHECK_INTERVAL)
 
 # Main Application
 async def main():
@@ -1185,8 +1516,8 @@ async def main():
                 logger.error(f"Couldn't notify admin {admin_id}: {e}")
 
         # Start background tasks
-        asyncio.create_task(scheduled_messages_task())
-        asyncio.create_task(spam_messages_task())
+        asyncio.create_task(scheduled_messages_task(app))
+        asyncio.create_task(spam_messages_task(app))
         asyncio.create_task(BotUtils.clean_old_media())
 
         # Keep running
