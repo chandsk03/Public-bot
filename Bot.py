@@ -10,19 +10,20 @@ from pyrogram import Client, filters, types
 from pyrogram.errors import RPCError, SessionPasswordNeeded
 from pyrogram.raw.all import layer
 from pyrogram.storage import FileStorage, MemoryStorage
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Configuration
+# Configuration - REPLACE WITH YOUR OWN CREDENTIALS
 API_ID = 25781839
 API_HASH = "20a3f2f168739259a180dcdd642e196c"
-BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqxVZQyqwfRpVCW6wOFc"
-ADMIN_IDS = [7584086775]
+BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"  # Get from @BotFather
+ADMIN_IDS = [7584086775]  # Your admin user ID
 SESSION_ROOT = "user_sessions"
 BACKUP_ROOT = "user_backups"
 DB_FILE = "sessions.db"
 MAX_SESSIONS_PER_USER = 5
 MAX_BACKUPS_PER_SESSION = 3
 
-# Ensure root folders exist
+# Ensure folders exist
 os.makedirs(SESSION_ROOT, exist_ok=True)
 os.makedirs(BACKUP_ROOT, exist_ok=True)
 
@@ -45,7 +46,7 @@ def init_db():
         )
     ''')
     
-    # Sessions table (fixed duplicate user_id issue)
+    # Sessions table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +75,7 @@ def init_db():
         )
     ''')
     
-    # Create admin user if not exists
+    # Create admin user
     for admin_id in ADMIN_IDS:
         cursor.execute('''
             INSERT OR IGNORE INTO users (user_id, is_admin, join_date, last_active)
@@ -104,13 +105,10 @@ def get_user_backup_folder(user_id: int) -> str:
     return folder
 
 def get_session_path(user_id: int, session_name: str) -> str:
-    folder = get_user_session_folder(user_id)
-    return os.path.join(folder, f"{session_name}.session")
+    return os.path.join(get_user_session_folder(user_id), f"{session_name}.session")
 
 def get_backup_path(user_id: int, session_name: str, timestamp: str) -> str:
-    folder = get_user_backup_folder(user_id)
-    filename = f"{session_name}_{timestamp}.backup"
-    return os.path.join(folder, filename)
+    return os.path.join(get_user_backup_folder(user_id), f"{session_name}_{timestamp}.backup")
 
 def format_proxy(proxy: Dict) -> str:
     if not proxy:
@@ -123,7 +121,6 @@ def format_proxy(proxy: Dict) -> str:
 def parse_proxy(proxy_str: str) -> Optional[Dict]:
     if not proxy_str or proxy_str.lower() == "none":
         return None
-    
     try:
         scheme, rest = proxy_str.split("://")
         if "@" in rest:
@@ -133,7 +130,6 @@ def parse_proxy(proxy_str: str) -> Optional[Dict]:
         else:
             hostname, port = rest.split(":")
             username, password = "", ""
-        
         return {
             "scheme": scheme,
             "hostname": hostname,
@@ -198,8 +194,34 @@ def get_session_backup_count(user_id: int, session_name: str) -> int:
     conn.close()
     return count
 
+def create_session_keyboard(sessions: List[Tuple]) -> InlineKeyboardMarkup:
+    buttons = []
+    for session in sessions:
+        name, _, _, is_active = session
+        status = "✅" if is_active else "❌"
+        buttons.append([InlineKeyboardButton(f"{status} {name}", callback_data=f"session_{name}")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(buttons)
+
+def create_main_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton("➕ Create Session", callback_data="create_session")],
+        [InlineKeyboardButton("📋 My Sessions", callback_data="list_sessions")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(buttons)
+
 # Bot setup
-bot = Client("session_manager_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client(
+    "session_manager_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workers=200
+)
 
 # Decorators
 def admin_only(func):
@@ -213,7 +235,7 @@ def admin_only(func):
 def private_chat_only(func):
     async def wrapper(client, message):
         if message.chat.type != "private":
-            await message.reply("🔒 This bot only works in private chats.")
+            await message.reply("🔒 Please use this bot in private chat by messaging me directly.")
             return
         return await func(client, message)
     return wrapper
@@ -255,167 +277,24 @@ By using this bot, you agree to these terms.
 - Proxy configuration for each session
 - Message sending from any session
 - Session string import/export
+""".format(terms if not is_admin(message.from_user.id) else terms + "\n\n👑 *Admin commands available*")
 
-📋 *Available Commands:*
-/create - Create new session
-/list - List your sessions
-/delete - Delete a session
-/backup - Backup a session
-/restore - Restore from backup
-/info - Get session details
-/activate - Activate session
-/deactivate - Deactivate session
-/setproxy - Configure proxy
-/send - Send message from session
-/export - Export session string
-/import - Import session string
-/stats - Your usage statistics
-/help - Show this message
+    keyboard = create_main_keyboard(is_admin(message.from_user.id))
+    await message.reply(welcome, reply_markup=keyboard, parse_mode="markdown")
 
-{}
-""".format(terms if not is_admin(message.from_user.id) else terms + "\n\n👑 *Admin commands:* /users, /ban, /unban")
-
-    await message.reply(welcome, parse_mode="markdown")
-
-@bot.on_message(filters.command("help") & filters.private)
-@private_chat_only
-@not_banned
-async def help_command(client, message):
-    await start(client, message)
-
-@bot.on_message(filters.command("create") & filters.private)
-@private_chat_only
-@not_banned
-async def create_session(client, message):
-    user_id = message.from_user.id
-    session_name = " ".join(message.command[1:]).strip()
-    
-    if not session_name:
-        await message.reply("Please provide a session name. Example: /create my_session")
-        return
-    
-    if not validate_session_name(session_name):
-        await message.reply("Invalid session name. Use 3-32 chars: letters, numbers, underscores, hyphens.")
-        return
-    
-    if get_user_session_count(user_id) >= MAX_SESSIONS_PER_USER:
-        await message.reply(f"You've reached the maximum of {MAX_SESSIONS_PER_USER} sessions.")
-        return
-    
-    session_path = get_session_path(user_id, session_name)
-    if os.path.exists(session_path):
-        await message.reply("A session with this name already exists.")
-        return
-    
-    # Ask for phone number
-    await message.reply(f"Creating session '{session_name}'. Please send the phone number (with country code, e.g. +1234567890):")
-    
-    try:
-        phone_number_msg = await client.listen(message.chat.id, filters.text, timeout=300)
-        phone_number = phone_number_msg.text.strip()
-    except asyncio.TimeoutError:
-        await message.reply("Session creation timed out. Please try again.")
-        return
-    
-    # Initialize client with MemoryStorage
-    temp_client = Client(
-        f":memory:{session_name}",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        app_version="Advanced Session Manager",
-        device_model="Pyrogram",
-        system_version="Layer " + str(layer),
-        in_memory=True
+@bot.on_callback_query(filters.regex("^back_to_main$"))
+async def back_to_main(client, callback_query):
+    keyboard = create_main_keyboard(is_admin(callback_query.from_user.id))
+    await callback_query.message.edit_text(
+        "🏠 *Main Menu*",
+        reply_markup=keyboard,
+        parse_mode="markdown"
     )
-    
-    await temp_client.connect()
-    
-    try:
-        sent_code = await temp_client.send_code(phone_number)
-    except RPCError as e:
-        await message.reply(f"Error: {e}")
-        await temp_client.disconnect()
-        return
-    
-    await message.reply(
-        f"A code has been sent to {phone_number}. Please send the code in the format:\n"
-        "`code first_name last_name`\n\n"
-        "Example: `12345 John Doe`"
-    )
-    
-    try:
-        code_msg = await client.listen(message.chat.id, filters.text, timeout=300)
-        code_parts = code_msg.text.split()
-        
-        if len(code_parts) < 3:
-            await message.reply("Invalid format. Please send code, first name, and last name.")
-            await temp_client.disconnect()
-            return
-            
-        code = code_parts[0]
-        first_name = code_parts[1]
-        last_name = " ".join(code_parts[2:])
-        
-        try:
-            await temp_client.sign_in(phone_number, sent_code.phone_code_hash, code)
-        except SessionPasswordNeeded:
-            await message.reply("This account has 2FA enabled. Please send your password:")
-            
-            try:
-                password_msg = await client.listen(message.chat.id, filters.text, timeout=300)
-                await temp_client.check_password(password_msg.text)
-            except asyncio.TimeoutError:
-                await message.reply("Session creation timed out. Please try again.")
-                await temp_client.disconnect()
-                return
-        
-        # Get user info
-        user = await temp_client.get_me()
-        
-        # Disconnect and reconnect with file storage
-        await temp_client.disconnect()
-        
-        # Create actual session file
-        file_storage = FileStorage(session_name, get_user_session_folder(user_id))
-        await file_storage.open()
-        file_storage.dc_id = temp_client.storage.dc_id()
-        file_storage.auth_key = temp_client.storage.auth_key()
-        file_storage.user_id = user.id
-        file_storage.date = int(datetime.now().timestamp())
-        await file_storage.save()
-        await file_storage.close()
-        
-        # Save to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO sessions (user_id, session_name, phone_number, created_at, last_used) VALUES (?, ?, ?, ?, ?)",
-            (user_id, session_name, phone_number, datetime.now().isoformat(), datetime.now().isoformat())
-        )
-        conn.commit()
-        conn.close()
-        
-        await message.reply(
-            f"✅ Session '{session_name}' created successfully!\n"
-            f"👤 User: {user.first_name} ({user.id})\n"
-            f"📱 Phone: {phone_number}\n\n"
-            f"🔐 This session is stored securely in your private folder."
-        )
-    except asyncio.TimeoutError:
-        await message.reply("Session creation timed out. Please try again.")
-    except RPCError as e:
-        await message.reply(f"Error: {e}")
-    finally:
-        try:
-            await temp_client.disconnect()
-        except:
-            pass
+    await callback_query.answer()
 
-@bot.on_message(filters.command("list") & filters.private)
-@private_chat_only
-@not_banned
-async def list_sessions(client, message):
-    user_id = message.from_user.id
+@bot.on_callback_query(filters.regex("^list_sessions$"))
+async def list_sessions_callback(client, callback_query):
+    user_id = callback_query.from_user.id
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
@@ -428,197 +307,21 @@ async def list_sessions(client, message):
     conn.close()
     
     if not sessions:
-        await message.reply("You don't have any sessions yet. Use /create to make one.")
+        await callback_query.answer("You don't have any sessions yet.", show_alert=True)
         return
     
-    response = "📋 Your Sessions:\n\n"
-    for session in sessions:
-        name, user_id, phone, is_active = session
-        status = "✅" if is_active else "❌"
-        response += f"{status} {name}"
-        if user_id:
-            response += f" (User ID: {user_id})"
-        if phone:
-            response += f" (Phone: {phone[:3]}****{phone[-3:]})"
-        response += "\n"
-    
-    response += f"\nYou have {len(sessions)}/{MAX_SESSIONS_PER_USER} sessions."
-    await message.reply(response)
-
-@bot.on_message(filters.command("delete") & filters.private)
-@private_chat_only
-@not_banned
-async def delete_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /delete my_session")
-        return
-    
-    session_name = message.command[1]
-    session_path = get_session_path(user_id, session_name)
-    
-    if not os.path.exists(session_path):
-        await message.reply("Session not found.")
-        return
-    
-    # Confirm deletion
-    await message.reply(
-        f"⚠️ Are you sure you want to delete session '{session_name}'?\n"
-        "This cannot be undone. Reply 'yes' to confirm."
+    keyboard = create_session_keyboard(sessions)
+    await callback_query.message.edit_text(
+        "📋 *Your Sessions*",
+        reply_markup=keyboard,
+        parse_mode="markdown"
     )
-    
-    try:
-        confirm_msg = await client.listen(message.chat.id, filters.text, timeout=60)
-        if confirm_msg.text.lower() != "yes":
-            await message.reply("Session deletion cancelled.")
-            return
-    except asyncio.TimeoutError:
-        await message.reply("Session deletion timed out.")
-        return
-    
-    # Delete session
-    try:
-        os.remove(session_path)
-        
-        # Remove from database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            DELETE FROM sessions 
-            WHERE user_id = ? AND session_name = ?
-        ''', (user_id, session_name))
-        conn.commit()
-        conn.close()
-        
-        await message.reply(f"✅ Session '{session_name}' deleted successfully.")
-    except Exception as e:
-        await message.reply(f"Error deleting session: {e}")
+    await callback_query.answer()
 
-@bot.on_message(filters.command("backup") & filters.private)
-@private_chat_only
-@not_banned
-async def backup_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /backup my_session")
-        return
-    
-    session_name = message.command[1]
-    session_path = get_session_path(user_id, session_name)
-    
-    if not os.path.exists(session_path):
-        await message.reply("Session not found.")
-        return
-    
-    if get_session_backup_count(user_id, session_name) >= MAX_BACKUPS_PER_SESSION:
-        await message.reply(f"You've reached the maximum of {MAX_BACKUPS_PER_SESSION} backups for this session.")
-        return
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = get_backup_path(user_id, session_name, timestamp)
-    
-    try:
-        # Copy session file
-        with open(session_path, "rb") as src, open(backup_path, "wb") as dst:
-            dst.write(src.read())
-        
-        # Save backup record
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO backups (backup_id, user_id, session_name, backup_time, file_path) VALUES (?, ?, ?, ?, ?)",
-            (f"{session_name}_{timestamp}", user_id, session_name, datetime.now().isoformat(), backup_path)
-        )
-        conn.commit()
-        conn.close()
-        
-        await message.reply(
-            f"✅ Session '{session_name}' backed up successfully!\n"
-            f"📦 Backup ID: {session_name}_{timestamp}\n"
-            f"⏱️ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-    except Exception as e:
-        await message.reply(f"Error creating backup: {e}")
-
-@bot.on_message(filters.command("restore") & filters.private)
-@private_chat_only
-@not_banned
-async def restore_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a backup ID. Example: /restore my_session_20230101_123456")
-        return
-    
-    backup_id = message.command[1]
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT session_name, file_path 
-        FROM backups 
-        WHERE user_id = ? AND backup_id = ?
-    ''', (user_id, backup_id))
-    backup = cursor.fetchone()
-    conn.close()
-    
-    if not backup:
-        await message.reply("Backup not found.")
-        return
-    
-    session_name, backup_path = backup
-    
-    if not os.path.exists(backup_path):
-        await message.reply("Backup file not found.")
-        return
-    
-    session_path = get_session_path(user_id, session_name)
-    
-    # Confirm restore if session exists
-    if os.path.exists(session_path):
-        await message.reply(
-            f"⚠️ A session with name '{session_name}' already exists.\n"
-            "Do you want to overwrite it? Reply 'yes' to confirm."
-        )
-        
-        try:
-            confirm_msg = await client.listen(message.chat.id, filters.text, timeout=60)
-            if confirm_msg.text.lower() != "yes":
-                await message.reply("Restore cancelled.")
-                return
-        except asyncio.TimeoutError:
-            await message.reply("Restore timed out.")
-            return
-    
-    try:
-        # Copy backup to session file
-        with open(backup_path, "rb") as src, open(session_path, "wb") as dst:
-            dst.write(src.read())
-        
-        # Update session info
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE sessions 
-            SET last_used = ? 
-            WHERE user_id = ? AND session_name = ?
-        ''', (datetime.now().isoformat(), user_id, session_name))
-        conn.commit()
-        conn.close()
-        
-        await message.reply(f"✅ Session '{session_name}' restored successfully from backup {backup_id}.")
-    except Exception as e:
-        await message.reply(f"Error restoring session: {e}")
-
-@bot.on_message(filters.command("info") & filters.private)
-@private_chat_only
-@not_banned
-async def session_info(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /info my_session")
-        return
-    
-    session_name = message.command[1]
+@bot.on_callback_query(filters.regex("^session_.+$"))
+async def session_detail(client, callback_query):
+    session_name = callback_query.data.split("_")[1]
+    user_id = callback_query.from_user.id
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -629,8 +332,7 @@ async def session_info(client, message):
     session = cursor.fetchone()
     
     if not session:
-        conn.close()
-        await message.reply("Session not found.")
+        await callback_query.answer("Session not found.", show_alert=True)
         return
     
     # Get backup count
@@ -643,388 +345,78 @@ async def session_info(client, message):
     
     # Format response
     response = (
-        f"📝 Session Info: {session_name}\n\n"
-        f"🆔 User ID: {session[3] or 'Not available'}\n"
-        f"📱 Phone: {session[4][:3] + '****' + session[4][-3:] if session[4] else 'Not available'}\n"
-        f"📅 Created: {datetime.fromisoformat(session[5]).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"⏱️ Last Used: {datetime.fromisoformat(session[6]).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"🔌 Proxy: {format_proxy(json.loads(session[8])) if session[8] else 'None'}\n"
-        f"📦 Backups: {backup_count}/{MAX_BACKUPS_PER_SESSION}\n"
-        f"🔘 Status: {'Active ✅' if session[7] else 'Inactive ❌'}"
+        f"📝 *Session Info*: `{session_name}`\n\n"
+        f"🆔 User ID: `{session[3] or 'Not available'}`\n"
+        f"📱 Phone: `{session[4][:3] + '****' + session[4][-3:] if session[4] else 'Not available'}`\n"
+        f"📅 Created: `{datetime.fromisoformat(session[5]).strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"⏱️ Last Used: `{datetime.fromisoformat(session[6]).strftime('%Y-%m-%d %H:%M:%S')}`\n"
+        f"🔌 Proxy: `{format_proxy(json.loads(session[8])) if session[8] else 'None'}`\n"
+        f"📦 Backups: `{backup_count}/{MAX_BACKUPS_PER_SESSION}`\n"
+        f"🔘 Status: `{'Active ✅' if session[7] else 'Inactive ❌'}`"
     )
     
-    await message.reply(response)
-
-@bot.on_message(filters.command("activate") & filters.private)
-@private_chat_only
-@not_banned
-async def activate_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /activate my_session")
-        return
+    buttons = [
+        [
+            InlineKeyboardButton("🔙 Back", callback_data="list_sessions"),
+            InlineKeyboardButton("⚙️ Manage", callback_data=f"manage_{session_name}")
+        ]
+    ]
     
-    session_name = message.command[1]
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE sessions 
-        SET is_active = 1 
-        WHERE user_id = ? AND session_name = ?
-    ''', (user_id, session_name))
-    conn.commit()
-    conn.close()
-    
-    await message.reply(f"✅ Session '{session_name}' activated.")
-
-@bot.on_message(filters.command("deactivate") & filters.private)
-@private_chat_only
-@not_banned
-async def deactivate_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /deactivate my_session")
-        return
-    
-    session_name = message.command[1]
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE sessions 
-        SET is_active = 0 
-        WHERE user_id = ? AND session_name = ?
-    ''', (user_id, session_name))
-    conn.commit()
-    conn.close()
-    
-    await message.reply(f"✅ Session '{session_name}' deactivated.")
-
-@bot.on_message(filters.command("setproxy") & filters.private)
-@private_chat_only
-@not_banned
-async def set_proxy(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 3:
-        await message.reply("Please provide a session name and proxy. Example: /setproxy my_session socks5://user:pass@127.0.0.1:1080")
-        return
-    
-    session_name = message.command[1]
-    proxy_str = " ".join(message.command[2:])
-    proxy = parse_proxy(proxy_str)
-    
-    if proxy is None:
-        await message.reply("Invalid proxy format. Please use scheme://[user:pass@]host:port (e.g. socks5://user:pass@127.0.0.1:1080)")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE sessions 
-        SET proxy_config = ? 
-        WHERE user_id = ? AND session_name = ?
-    ''', (json.dumps(proxy), user_id, session_name))
-    conn.commit()
-    conn.close()
-    
-    await message.reply(f"✅ Proxy for session '{session_name}' set to {format_proxy(proxy)}")
-
-@bot.on_message(filters.command("send") & filters.private)
-@private_chat_only
-@not_banned
-async def send_message(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 4:
-        await message.reply("Please provide session name, chat ID, and message. Example: /send my_session @channel Hello!")
-        return
-    
-    session_name = message.command[1]
-    chat_id = message.command[2]
-    text = " ".join(message.command[3:])
-    
-    session_path = get_session_path(user_id, session_name)
-    if not os.path.exists(session_path):
-        await message.reply("Session not found.")
-        return
-    
-    # Get proxy config
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT proxy_config FROM sessions 
-        WHERE user_id = ? AND session_name = ?
-    ''', (user_id, session_name))
-    proxy_config = cursor.fetchone()[0]
-    conn.close()
-    
-    proxy = json.loads(proxy_config) if proxy_config else None
-    
-    # Initialize client
-    app = Client(
-        session_name,
-        api_id=API_ID,
-        api_hash=API_HASH,
-        workdir=get_user_session_folder(user_id),
-        proxy=proxy
+    await callback_query.message.edit_text(
+        response,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="markdown"
     )
-    
-    try:
-        await app.start()
-        
-        # Update last used time
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE sessions 
-            SET last_used = ? 
-            WHERE user_id = ? AND session_name = ?
-        ''', (datetime.now().isoformat(), user_id, session_name))
-        conn.commit()
-        conn.close()
-        
-        # Send message
-        await app.send_message(chat_id, text)
-        await message.reply(f"✅ Message sent from session '{session_name}' to {chat_id}")
-    except RPCError as e:
-        await message.reply(f"Error sending message: {e}")
-    finally:
-        try:
-            await app.stop()
-        except:
-            pass
+    await callback_query.answer()
 
-@bot.on_message(filters.command("export") & filters.private)
-@private_chat_only
-@not_banned
-async def export_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 2:
-        await message.reply("Please provide a session name. Example: /export my_session")
-        return
+@bot.on_callback_query(filters.regex("^manage_.+$"))
+async def manage_session(client, callback_query):
+    session_name = callback_query.data.split("_")[1]
+    user_id = callback_query.from_user.id
     
-    session_name = message.command[1]
-    session_path = get_session_path(user_id, session_name)
+    buttons = [
+        [
+            InlineKeyboardButton("📤 Export", callback_data=f"export_{session_name}"),
+            InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{session_name}")
+        ],
+        [
+            InlineKeyboardButton("🔁 Backup", callback_data=f"backup_{session_name}"),
+            InlineKeyboardButton("🔄 Restore", callback_data=f"restore_menu_{session_name}")
+        ],
+        [
+            InlineKeyboardButton("🔌 Set Proxy", callback_data=f"proxy_{session_name}"),
+            InlineKeyboardButton("💬 Send Msg", callback_data=f"send_{session_name}")
+        ],
+        [
+            InlineKeyboardButton("✅ Activate" if not is_active else "❌ Deactivate", 
+                                callback_data=f"toggle_{session_name}"),
+            InlineKeyboardButton("🔙 Back", callback_data=f"session_{session_name}")
+        ]
+    ]
     
-    if not os.path.exists(session_path):
-        await message.reply("Session not found.")
-        return
-    
-    try:
-        storage = FileStorage(session_name, get_user_session_folder(user_id))
-        await storage.open()
-        session_string = await storage.export_session_string()
-        await storage.close()
-        
-        await message.reply(
-            f"📦 Session string for '{session_name}':\n\n"
-            f"`{session_string}`\n\n"
-            "⚠️ Keep this string secure! Anyone with this string can access the account."
-        )
-    except Exception as e:
-        await message.reply(f"Error exporting session: {e}")
-
-@bot.on_message(filters.command("import") & filters.private)
-@private_chat_only
-@not_banned
-async def import_session(client, message):
-    user_id = message.from_user.id
-    if len(message.command) < 3:
-        await message.reply("Please provide a session name and session string. Example: /import my_session session_string")
-        return
-    
-    session_name = message.command[1]
-    session_string = " ".join(message.command[2:])
-    
-    if get_user_session_count(user_id) >= MAX_SESSIONS_PER_USER:
-        await message.reply(f"You've reached the maximum of {MAX_SESSIONS_PER_USER} sessions.")
-        return
-    
-    session_path = get_session_path(user_id, session_name)
-    if os.path.exists(session_path):
-        await message.reply("A session with this name already exists.")
-        return
-    
-    try:
-        # Create in-memory client to validate session string
-        temp_client = Client(
-            ":memory:",
-            api_id=API_ID,
-            api_hash=API_HASH,
-            in_memory=True
-        )
-        
-        await temp_client.connect()
-        await temp_client.import_session_string(session_string)
-        
-        # Get user info
-        user = await temp_client.get_me()
-        
-        # Disconnect and reconnect with file storage
-        await temp_client.disconnect()
-        
-        # Create actual session file
-        file_storage = FileStorage(session_name, get_user_session_folder(user_id))
-        await file_storage.open()
-        file_storage.dc_id = temp_client.storage.dc_id()
-        file_storage.auth_key = temp_client.storage.auth_key()
-        file_storage.user_id = user.id
-        file_storage.date = int(datetime.now().timestamp())
-        await file_storage.save()
-        await file_storage.close()
-        
-        # Save to database
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO sessions (user_id, session_name, created_at, last_used) VALUES (?, ?, ?, ?)",
-            (user_id, session_name, datetime.now().isoformat(), datetime.now().isoformat())
-        )
-        conn.commit()
-        conn.close()
-        
-        await message.reply(
-            f"✅ Session '{session_name}' imported successfully!\n"
-            f"👤 User: {user.first_name} ({user.id})"
-        )
-    except RPCError as e:
-        await message.reply(f"Error importing session: {e}")
-    finally:
-        try:
-            await temp_client.disconnect()
-        except:
-            pass
-
-@bot.on_message(filters.command("stats") & filters.private)
-@private_chat_only
-@not_banned
-async def user_stats(client, message):
-    user_id = message.from_user.id
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Session stats
-    cursor.execute('''
-        SELECT COUNT(*) FROM sessions 
-        WHERE user_id = ?
-    ''', (user_id,))
-    total_sessions = cursor.fetchone()[0]
-    
-    cursor.execute('''
-        SELECT COUNT(*) FROM sessions 
-        WHERE user_id = ? AND is_active = 1
-    ''', (user_id,))
-    active_sessions = cursor.fetchone()[0]
-    
-    cursor.execute('''
-        SELECT COUNT(*) FROM backups 
-        WHERE user_id = ?
-    ''', (user_id,))
-    total_backups = cursor.fetchone()[0]
-    
-    # Oldest and newest sessions
-    cursor.execute('''
-        SELECT MIN(created_at), MAX(created_at) 
-        FROM sessions 
-        WHERE user_id = ?
-    ''', (user_id,))
-    oldest, newest = cursor.fetchone()
-    
-    conn.close()
-    
-    response = (
-        "📊 Your Statistics\n\n"
-        f"📋 Total Sessions: {total_sessions}/{MAX_SESSIONS_PER_USER}\n"
-        f"✅ Active Sessions: {active_sessions}\n"
-        f"📦 Total Backups: {total_backups}\n"
-        f"📅 Oldest Session: {datetime.fromisoformat(oldest).strftime('%Y-%m-%d') if oldest else 'N/A'}\n"
-        f"🆕 Newest Session: {datetime.fromisoformat(newest).strftime('%Y-%m-%d') if newest else 'N/A'}"
+    await callback_query.message.edit_text(
+        f"⚙️ *Managing Session*: `{session_name}`",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="markdown"
     )
-    
-    await message.reply(response)
+    await callback_query.answer()
 
-# Admin commands
-@bot.on_message(filters.command("users") & filters.private)
-@admin_only
-async def list_users(client, message):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, username, first_name, last_name, is_banned, is_admin 
-        FROM users 
-        ORDER BY join_date DESC
-    ''')
-    users = cursor.fetchall()
-    conn.close()
-    
-    if not users:
-        await message.reply("No users found.")
-        return
-    
-    response = "👥 User List:\n\n"
-    for user in users:
-        user_id, username, first_name, last_name, is_banned, is_admin = user
-        status = "🚫" if is_banned else "✅"
-        admin = "👑" if is_admin else ""
-        response += f"{status} {admin} {first_name} {last_name} (@{username}) - ID: {user_id}\n"
-    
-    await message.reply(response)
-
-@bot.on_message(filters.command("ban") & filters.private)
-@admin_only
-async def ban_user(client, message):
-    if len(message.command) < 2:
-        await message.reply("Please provide a user ID. Example: /ban 123456789")
-        return
-    
-    try:
-        target_id = int(message.command[1])
-    except ValueError:
-        await message.reply("Invalid user ID.")
-        return
-    
-    if target_id in ADMIN_IDS:
-        await message.reply("Cannot ban an admin.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users 
-        SET is_banned = 1 
-        WHERE user_id = ?
-    ''', (target_id,))
-    conn.commit()
-    conn.close()
-    
-    await message.reply(f"✅ User {target_id} has been banned.")
-
-@bot.on_message(filters.command("unban") & filters.private)
-@admin_only
-async def unban_user(client, message):
-    if len(message.command) < 2:
-        await message.reply("Please provide a user ID. Example: /unban 123456789")
-        return
-    
-    try:
-        target_id = int(message.command[1])
-    except ValueError:
-        await message.reply("Invalid user ID.")
-        return
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE users 
-        SET is_banned = 0 
-        WHERE user_id = ?
-    ''', (target_id,))
-    conn.commit()
-    conn.close()
-    
-    await message.reply(f"✅ User {target_id} has been unbanned.")
+# Error handler
+@bot.on_message(filters.group)
+async def handle_group_messages(client, message):
+    await message.reply(
+        "🔒 This bot only works in private chats. "
+        "Please message me directly to use the bot features.\n\n"
+        "Click here to start a private chat: [Start Private Chat](https://t.me/{}?start=help)"
+        .format((await client.get_me()).username),
+        disable_web_page_preview=True
+    )
 
 # Run the bot
 if __name__ == "__main__":
     print("Starting advanced session manager bot...")
-    bot.run()
+    try:
+        bot.run()
+    except Exception as e:
+        print(f"Failed to start bot: {e}")
+        print("Please check your BOT_TOKEN and make sure it's valid")
