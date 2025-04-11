@@ -12,15 +12,15 @@ from pyrogram.raw.all import layer
 from pyrogram.storage import FileStorage, MemoryStorage
 
 # Configuration
-API_ID = 25781839  # Replace with your API ID
-API_HASH = "20a3f2f168739259a180dcdd642e196c"  # Replace with your API hash
-BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqxVZQyqwfRpVCW6wOFc"  # Replace with your bot token
-ADMIN_IDS = [7584086775]  # Replace with admin user IDs
+API_ID = 25781839
+API_HASH = "20a3f2f168739259a180dcdd642e196c"
+BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqxVZQyqwfRpVCW6wOFc"
+ADMIN_IDS = [7584086775]
 SESSION_ROOT = "user_sessions"
 BACKUP_ROOT = "user_backups"
 DB_FILE = "sessions.db"
-MAX_SESSIONS_PER_USER = 5  # Limit sessions per user
-MAX_BACKUPS_PER_SESSION = 3  # Limit backups per session
+MAX_SESSIONS_PER_USER = 5
+MAX_BACKUPS_PER_SESSION = 3
 
 # Ensure root folders exist
 os.makedirs(SESSION_ROOT, exist_ok=True)
@@ -45,13 +45,12 @@ def init_db():
         )
     ''')
     
-    # Sessions table
+    # Sessions table (fixed duplicate user_id issue)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS sessions (
             session_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             session_name TEXT,
-            user_id INTEGER,
             phone_number TEXT,
             created_at TEXT,
             last_used TEXT,
