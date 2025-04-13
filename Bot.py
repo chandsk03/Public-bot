@@ -8,6 +8,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     CallbackQueryHandler,
+    MessageHandler,
     filters
 )
 
@@ -16,7 +17,7 @@ API_ID = 25781839
 API_HASH = "20a3f2f168739259a180dcdd642e196c"
 BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"
 ADMIN_IDS = [7584086775]
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.1.1"
 START_TIME = datetime.now()
 DATABASE_FILE = "bot_database.db"
 
