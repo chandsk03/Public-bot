@@ -17,7 +17,7 @@ API_ID = 25781839
 API_HASH = "20a3f2f168739259a180dcdd642e196c"
 BOT_TOKEN = "7614305417:AAGyXRK5sPap2V2elxVZQyqwfRpVCW6wOFc"
 ADMIN_IDS = [7584086775]
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.4.0"
 START_TIME = datetime.now()
 DATABASE_FILE = "bot_database.db"
 LOG_FILE = "bot.log"
@@ -27,7 +27,8 @@ RATE_LIMITS = {
     'start': timedelta(seconds=10),
     'stats': timedelta(minutes=1),
     'userinfo': timedelta(seconds=30),
-    'broadcast': timedelta(minutes=5)
+    'broadcast': timedelta(minutes=5),
+    'feedback': timedelta(minutes=2)
 }
 
 # Logging setup
@@ -106,12 +107,23 @@ class DatabaseManager:
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feedback (
+                feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
         # Insert default settings if not exists
         cursor.execute('''
             INSERT OR IGNORE INTO bot_settings (setting_name, setting_value)
             VALUES ('terms_and_conditions', 'Default Terms and Conditions. Please update through admin panel.'),
                    ('privacy_policy', 'Default Privacy Policy. Please update through admin panel.'),
-                   ('welcome_message', 'Welcome to the bot! Use /start to begin.')
+                   ('welcome_message', 'Welcome to the bot! Use /start to begin.'),
+                   ('feedback_message', 'Thank you for your feedback! We appreciate your input.')
         ''')
         
         conn.commit()
@@ -139,12 +151,16 @@ class DatabaseManager:
         conn = cls.get_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        return dict(cursor.fetchone()) if cursor.fetchone() else None
+        result = cursor.fetchone()
+        return dict(result) if result else None
     
     @classmethod
     def update_user(cls, user_data: Dict):
         conn = cls.get_connection()
         cursor = conn.cursor()
+        
+        # Handle is_premium which might be None
+        is_premium = 1 if user_data.get('is_premium') else 0
         
         cursor.execute('''
             INSERT OR REPLACE INTO users (
@@ -158,7 +174,7 @@ class DatabaseManager:
             user_data.get('first_name'),
             user_data.get('last_name'),
             user_data.get('language_code'),
-            int(user_data.get('is_premium', False)),
+            is_premium,
             int(user_data.get('is_bot', False)),
             datetime.now(),
             int(user_data.get('is_banned', False)),
@@ -220,7 +236,8 @@ class DatabaseManager:
             ''').fetchone()[0],
             'total_commands': cursor.execute('SELECT COUNT(*) FROM commands').fetchone()[0],
             'banned_users': cursor.execute('SELECT COUNT(*) FROM users WHERE is_banned = 1').fetchone()[0],
-            'limited_users': cursor.execute('SELECT COUNT(*) FROM users WHERE is_limited = 1').fetchone()[0]
+            'limited_users': cursor.execute('SELECT COUNT(*) FROM users WHERE is_limited = 1').fetchone()[0],
+            'feedback_count': cursor.execute('SELECT COUNT(*) FROM feedback').fetchone()[0]
         }
         
         return stats
@@ -318,12 +335,47 @@ class DatabaseManager:
     @classmethod
     def is_banned(cls, user_id: int) -> bool:
         user = cls.get_user(user_id)
-        return user and user['is_banned'] == 1
+        return bool(user and user.get('is_banned', 0) == 1)
     
     @classmethod
     def is_limited(cls, user_id: int) -> bool:
         user = cls.get_user(user_id)
-        return user and user['is_limited'] == 1
+        return bool(user and user.get('is_limited', 0) == 1)
+    
+    @classmethod
+    def add_feedback(cls, user_id: int, message: str) -> bool:
+        conn = cls.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO feedback (user_id, message)
+                VALUES (?, ?)
+            ''', (user_id, message))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding feedback: {e}")
+            return False
+    
+    @classmethod
+    def get_feedback(cls, limit: int = 10) -> List[Dict]:
+        conn = cls.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT f.*, u.username, u.first_name, u.last_name 
+            FROM feedback f
+            LEFT JOIN users u ON f.user_id = u.user_id
+            ORDER BY f.timestamp DESC
+            LIMIT ?
+        ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def format_time_remaining(seconds: int, command: str) -> str:
+    """Format time remaining with a progress bar"""
+    total_seconds = RATE_LIMITS[command].total_seconds()
+    progress = min(int((seconds / total_seconds) * 10), 10)
+    bar = "▓" * progress + "░" * (10 - progress)
+    return f"⏳ Cooldown: [{bar}] {seconds}s remaining"
 
 # Initialize database
 DatabaseManager.init_db()
@@ -335,13 +387,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Check rate limiting
     if (time_remaining := DatabaseManager.check_rate_limit(user.id, 'start')):
         await update.message.reply_text(
-            f"Please wait {time_remaining.seconds} seconds before using /start again."
+            format_time_remaining(int(time_remaining.total_seconds()), 'start')
         )
         return
     
     # Check if user is banned
     if DatabaseManager.is_banned(user.id):
-        await update.message.reply_text("Your account has been banned from using this bot.")
+        await update.message.reply_text("⛔ Your account has been banned from using this bot.")
         return
     
     # Update user data
@@ -370,13 +422,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_details += f"🌐 Language: {user.language_code}\n" if user.language_code else "🌐 Language: Not set\n"
     user_details += f"💎 Premium: {'Yes' if getattr(user, 'is_premium', False) else 'No'}\n"
     user_details += f"🤖 Bot: {'Yes' if user.is_bot else 'No'}\n"
-    user_details += f"🔒 Status: {'❌ Banned' if DatabaseManager.is_banned(user.id) else '⚠️ Limited' if DatabaseManager.is_limited(user.id) else '✅ Active'}\n"
+    
+    # Get user status safely
+    user_status = "❌ Banned" if DatabaseManager.is_banned(user.id) else (
+                 "⚠️ Limited" if DatabaseManager.is_limited(user.id) else "✅ Active")
+    user_details += f"🔒 Status: {user_status}\n"
     
     # Create keyboard with options
     keyboard = [
         [InlineKeyboardButton("📜 Terms", callback_data="terms"),
          InlineKeyboardButton("🔏 Privacy", callback_data="privacy")],
-        [InlineKeyboardButton("ℹ️ Bot Info", callback_data="version")]
+        [InlineKeyboardButton("ℹ️ Bot Info", callback_data="version"),
+         InlineKeyboardButton("💬 Feedback", callback_data="feedback")]
     ]
     
     if user.id in ADMIN_IDS:
@@ -429,6 +486,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             text=version_info,
             reply_markup=back_button_markup()
         )
+    elif query.data == "feedback":
+        if (time_remaining := DatabaseManager.check_rate_limit(user_id, 'feedback')):
+            await query.edit_message_text(
+                format_time_remaining(int(time_remaining.total_seconds()), 'feedback')
+            )
+            return
+        
+        context.user_data['pending_action'] = 'feedback'
+        await query.edit_message_text(
+            text="💬 Please send your feedback message:",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="back")]])
+        )
     elif query.data == "adminpanel":
         if user_id not in ADMIN_IDS:
             await query.edit_message_text("⛔ Access denied.")
@@ -444,6 +513,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             [InlineKeyboardButton("📝 Update Terms", callback_data="updateterms"),
              InlineKeyboardButton("📝 Update Policy", callback_data="updatepolicy")],
             [InlineKeyboardButton("📢 Broadcast", callback_data="broadcast")],
+            [InlineKeyboardButton("📩 View Feedback", callback_data="viewfeedback")],
             [InlineKeyboardButton("🔙 Back", callback_data="back")]
         ]
         
@@ -470,11 +540,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"🟢 Active today: {stats['active_today']}\n"
             f"🔄 Commands processed: {stats['total_commands']}\n"
             f"⛔ Banned users: {stats['banned_users']}\n"
-            f"🔒 Limited users: {stats['limited_users']}"
+            f"🔒 Limited users: {stats['limited_users']}\n"
+            f"📩 Feedback received: {stats['feedback_count']}"
         )
         
         await query.edit_message_text(
             text=stats_message,
+            reply_markup=back_to_admin_markup()
+        )
+    elif query.data == "viewfeedback":
+        if user_id not in ADMIN_IDS:
+            await query.edit_message_text("⛔ Access denied.")
+            return
+            
+        feedback_list = DatabaseManager.get_feedback()
+        if not feedback_list:
+            await query.edit_message_text("ℹ️ No feedback has been submitted yet.")
+            return
+            
+        feedback_message = "📩 RECENT FEEDBACK\n\n"
+        for i, feedback in enumerate(feedback_list, 1):
+            user_info = f"@{feedback['username']}" if feedback['username'] else f"{feedback['first_name']} {feedback['last_name']}"
+            feedback_message += (
+                f"{i}. From: {user_info} (ID: {feedback['user_id']})\n"
+                f"   Message: {feedback['message']}\n"
+                f"   Date: {feedback['timestamp']}\n\n"
+            )
+        
+        await query.edit_message_text(
+            text=feedback_message,
             reply_markup=back_to_admin_markup()
         )
     elif query.data == "back":
@@ -490,12 +584,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_details += f"🌐 Language: {user.language_code}\n" if user.language_code else "🌐 Language: Not set\n"
         user_details += f"💎 Premium: {'Yes' if getattr(user, 'is_premium', False) else 'No'}\n"
         user_details += f"🤖 Bot: {'Yes' if user.is_bot else 'No'}\n"
-        user_details += f"🔒 Status: {'❌ Banned' if DatabaseManager.is_banned(user.id) else '⚠️ Limited' if DatabaseManager.is_limited(user.id) else '✅ Active'}\n"
+        
+        # Get user status safely
+        user_status = "❌ Banned" if DatabaseManager.is_banned(user.id) else (
+                     "⚠️ Limited" if DatabaseManager.is_limited(user.id) else "✅ Active")
+        user_details += f"🔒 Status: {user_status}\n"
         
         keyboard = [
             [InlineKeyboardButton("📜 Terms", callback_data="terms"),
              InlineKeyboardButton("🔏 Privacy", callback_data="privacy")],
-            [InlineKeyboardButton("ℹ️ Bot Info", callback_data="version")]
+            [InlineKeyboardButton("ℹ️ Bot Info", callback_data="version"),
+             InlineKeyboardButton("💬 Feedback", callback_data="feedback")]
         ]
         
         if user.id in ADMIN_IDS:
@@ -503,7 +602,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await query.edit_message_text(
             text=user_details,
-            reply_markup=InlineKeyboardMarkup(keyboard))
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
     elif query.data in ["banuser", "unbanuser", "limituser", "unlimituser", "userlookup", 
                        "updateterms", "updatepolicy", "broadcast"]:
         if user_id not in ADMIN_IDS:
@@ -600,7 +700,7 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "broadcast":
         if (time_remaining := DatabaseManager.check_rate_limit(user.id, 'broadcast')):
             await update.message.reply_text(
-                f"⏳ Please wait {time_remaining.seconds//60}m {time_remaining.seconds%60}s before broadcasting again."
+                format_time_remaining(int(time_remaining.total_seconds()), 'broadcast')
             )
             return
         
@@ -627,6 +727,24 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"✅ Success: {success}\n"
             f"❌ Failed: {failed}"
         )
+    
+    del context.user_data['pending_action']
+
+async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle user feedback submission."""
+    user = update.effective_user
+    
+    if 'pending_action' not in context.user_data or context.user_data['pending_action'] != 'feedback':
+        return
+    
+    feedback_message = update.message.text
+    
+    # Log the feedback
+    if DatabaseManager.add_feedback(user.id, feedback_message):
+        feedback_response = DatabaseManager.get_setting('feedback_message')
+        await update.message.reply_text(feedback_response)
+    else:
+        await update.message.reply_text("❌ Failed to submit feedback. Please try again later.")
     
     del context.user_data['pending_action']
 
@@ -662,7 +780,7 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if (time_remaining := DatabaseManager.check_rate_limit(user.id, 'stats')):
         await update.message.reply_text(
-            f"⏳ Please wait {time_remaining.seconds} seconds before using /stats again."
+            format_time_remaining(int(time_remaining.total_seconds()), 'stats')
         )
         return
     
@@ -683,7 +801,8 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🟢 Active today: {stats['active_today']}\n"
         f"🔄 Commands processed: {stats['total_commands']}\n"
         f"⛔ Banned users: {stats['banned_users']}\n"
-        f"🔒 Limited users: {stats['limited_users']}"
+        f"🔒 Limited users: {stats['limited_users']}\n"
+        f"📩 Feedback received: {stats['feedback_count']}"
     )
     
     await update.message.reply_text(stats_message)
@@ -698,7 +817,7 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     if (time_remaining := DatabaseManager.check_rate_limit(user.id, 'userinfo')):
         await update.message.reply_text(
-            f"⏳ Please wait {time_remaining.seconds} seconds before using /userinfo again."
+            format_time_remaining(int(time_remaining.total_seconds()), 'userinfo')
         )
         return
     
@@ -740,10 +859,27 @@ def back_to_admin_markup():
     """Helper function to create back to admin panel button markup"""
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Admin", callback_data="adminpanel")]])
 
+def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and handle them gracefully."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    
+    if update and hasattr(update, 'effective_user'):
+        user = update.effective_user
+        try:
+            context.bot.send_message(
+                chat_id=user.id,
+                text="❌ An error occurred. Please try again later."
+            )
+        except Exception:
+            pass
+
 def main() -> None:
     """Run the bot."""
     # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
+
+    # Add error handler
+    application.add_error_handler(error_handler)
 
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
@@ -752,20 +888,28 @@ def main() -> None:
     application.add_handler(CommandHandler("userinfo", user_info_command, filters=filters.User(ADMIN_IDS)))
     application.add_handler(CommandHandler("cancel", cancel_action, filters=filters.User(ADMIN_IDS)))
     
-    # Add message handler for admin actions
+    # Add message handlers
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_IDS),
         handle_admin_action
+    ))
+    
+    # Add message handler for feedback
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handle_feedback
     ))
     
     # Add callback query handler
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Run the bot
+    logger.info("Starting bot...")
     application.run_polling()
     
     # Close database connection when bot stops
     DatabaseManager.close_connection()
+    logger.info("Bot stopped")
 
 if __name__ == "__main__":
     main()
